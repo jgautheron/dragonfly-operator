@@ -204,35 +204,24 @@ type ClusterSpec struct {
 	// +kubebuilder:default:=9999
 	AdminPort int32 `json:"adminPort,omitempty"`
 
-	// Shards lists the desired shard layout. Each shard maps to a primary node
-	// with optional replicas that share the same slot ranges.
-	// +kubebuilder:validation:MinItems=1
-	Shards []ClusterShardSpec `json:"shards"`
-}
-
-// ClusterShardSpec declares a shard topology.
-type ClusterShardSpec struct {
-	// Name is appended to managed resource names for determinism.
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	Name string `json:"name"`
-
-	// SlotRanges denotes the hash slots served by this shard.
-	// +kubebuilder:validation:MinItems=1
-	SlotRanges []SlotRange `json:"slotRanges"`
-
-	// Replicas is the total number of nodes in this shard (1 == primary only).
+	// Shards is the number of shards to create. Hash slots are automatically
+	// distributed evenly across all shards.
 	// +kubebuilder:validation:Minimum=1
-	Replicas int32 `json:"replicas"`
+	Shards int32 `json:"shards"`
+
+	// ReplicasPerShard is the number of replicas per shard (1 = primary only).
+	// Defaults to 1 when unset.
+	// +optional
+	// +kubebuilder:default:=1
+	// +kubebuilder:validation:Minimum=1
+	ReplicasPerShard int32 `json:"replicasPerShard,omitempty"`
 }
 
-// SlotRange describes a half-open hash slot interval owned by a shard.
+// SlotRange describes a hash slot interval owned by a shard (used internally).
+// Both Start and End are inclusive (e.g., Start=0, End=8191 covers 8192 slots).
 type SlotRange struct {
-	// Start inclusive slot index.
-	// +kubebuilder:validation:Minimum=0
 	Start int32 `json:"start"`
-	// End exclusive slot index.
-	// +kubebuilder:validation:Maximum=16384
-	End int32 `json:"end"`
+	End   int32 `json:"end"`
 }
 
 type OwnedObjectsMetadata struct {
@@ -296,6 +285,11 @@ type Snapshot struct {
 	// +optional
 	// +kubebuilder:validation:Optional
 	PersistentVolumeClaimSpec *corev1.PersistentVolumeClaimSpec `json:"persistentVolumeClaimSpec,omitempty"`
+
+	// (Optional) Name of an existing PVC to use for Dragonfly snapshots
+	// +optional
+	// +kubebuilder:validation:Optional
+	ExistingPersistentVolumeClaimName string `json:"existingPersistentVolumeClaimName,omitempty"`
 }
 
 type Authentication struct {

@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -168,6 +170,9 @@ func checkAndK8sPortForwardRedis(ctx context.Context, clientset *kubernetes.Clie
 
 	redisOptions := &redis.Options{
 		Addr: fmt.Sprintf("localhost:%d", port),
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
 	}
 
 	if password != "" {
@@ -194,6 +199,104 @@ func checkAndK8sPortForwardRedis(ctx context.Context, clientset *kubernetes.Clie
 	}
 
 	return redisClient, nil
+}
+
+type slotRange struct {
+	Start int64
+	End   int64
+}
+
+func getClusterSlotRanges(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config, pod *corev1.Pod, adminPort int) ([]slotRange, error) {
+	result, err := setupPortForwardWithCleanup(ctx, clientset, config, pod, adminPort, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer result.Cleanup()
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: fmt.Sprintf("localhost:%d", result.LocalPort),
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	defer redisClient.Close()
+
+	resp, err := redisClient.Do(ctx, "CLUSTER", "SHARDS").Result()
+	if err != nil {
+		return nil, err
+	}
+
+	ranges, err := parseClusterShardSlots(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].Start == ranges[j].Start {
+			return ranges[i].End < ranges[j].End
+		}
+		return ranges[i].Start < ranges[j].Start
+	})
+
+	return ranges, nil
+}
+
+func parseClusterShardSlots(resp interface{}) ([]slotRange, error) {
+	shards, ok := resp.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected cluster shards response type: %T", resp)
+	}
+
+	var ranges []slotRange
+	for _, shard := range shards {
+		items, ok := shard.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("unexpected shard entry type: %T", shard)
+		}
+		for i := 0; i+1 < len(items); i += 2 {
+			key, ok := items[i].(string)
+			if !ok {
+				continue
+			}
+			if key != "slots" {
+				continue
+			}
+			slotItems, ok := items[i+1].([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("unexpected slots type: %T", items[i+1])
+			}
+			// Dragonfly returns slots as a flat array [start, end, start, end, ...]
+			// Parse pairs from the flat list
+			for j := 0; j+1 < len(slotItems); j += 2 {
+				start, err := toInt64(slotItems[j])
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse slot start: %w", err)
+				}
+				end, err := toInt64(slotItems[j+1])
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse slot end: %w", err)
+				}
+				ranges = append(ranges, slotRange{Start: start, End: end})
+			}
+		}
+	}
+
+	return ranges, nil
+}
+
+func toInt64(value interface{}) (int64, error) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case uint64:
+		return int64(v), nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	default:
+		return 0, fmt.Errorf("unexpected numeric type: %T", value)
+	}
 }
 
 type portForwardResult struct {

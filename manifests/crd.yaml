@@ -4288,54 +4288,21 @@ spec:
                     - Emulated
                     - MultiShard
                     type: string
+                  replicasPerShard:
+                    default: 1
+                    description: |-
+                      ReplicasPerShard is the number of replicas per shard (1 = primary only).
+                      Defaults to 1 when unset.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   shards:
                     description: |-
-                      Shards lists the desired shard layout. Each shard maps to a primary node
-                      with optional replicas that share the same slot ranges.
-                    items:
-                      description: ClusterShardSpec declares a shard topology.
-                      properties:
-                        name:
-                          description: Name is appended to managed resource names
-                            for determinism.
-                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                          type: string
-                        replicas:
-                          description: Replicas is the total number of nodes in this
-                            shard (1 == primary only).
-                          format: int32
-                          minimum: 1
-                          type: integer
-                        slotRanges:
-                          description: SlotRanges denotes the hash slots served by
-                            this shard.
-                          items:
-                            description: SlotRange describes a half-open hash slot
-                              interval owned by a shard.
-                            properties:
-                              end:
-                                description: End exclusive slot index.
-                                format: int32
-                                maximum: 16384
-                                type: integer
-                              start:
-                                description: Start inclusive slot index.
-                                format: int32
-                                minimum: 0
-                                type: integer
-                            required:
-                            - end
-                            - start
-                            type: object
-                          minItems: 1
-                          type: array
-                      required:
-                      - name
-                      - replicas
-                      - slotRanges
-                      type: object
-                    minItems: 1
-                    type: array
+                      Shards is the number of shards to create. Hash slots are automatically
+                      distributed evenly across all shards.
+                    format: int32
+                    minimum: 1
+                    type: integer
                 required:
                 - mode
                 - shards
@@ -6473,6 +6440,10 @@ spec:
                   enableOnMasterOnly:
                     description: (Optional) Enable snapshot on master only
                     type: boolean
+                  existingPersistentVolumeClaimName:
+                    description: (Optional) Name of an existing PVC to use for Dragonfly
+                      snapshots
+                    type: string
                   persistentVolumeClaimSpec:
                     description: (Optional) Dragonfly PVC spec
                     properties:

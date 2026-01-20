@@ -50,7 +50,7 @@ A service of the form `<dragonfly-name>.<namespace>.svc.cluster.local` will be c
 
 ### Deploying Dragonfly in real cluster mode
 
-When you need Dragonfly's native multi-shard data plane instead of the emulated single-shard behavior, set the `spec.cluster` stanza on the `Dragonfly` resource. Each shard declaration maps to one primary node with optional replicas and the hash-slot ranges that shard owns. The operator provisions one StatefulSet per shard, configures replication, and continuously applies the `DFLYCLUSTER CONFIG` payload to all nodes so that Redis/Valkey clients can discover the topology natively ([docs](https://www.dragonflydb.io/docs/managing-dragonfly/cluster-mode)).
+When you need Dragonfly's native multi-shard data plane instead of the emulated single-shard behavior, set the `spec.cluster` stanza on the `Dragonfly` resource. The operator automatically distributes the 16384 hash slots evenly across all shards, provisions one StatefulSet per shard, configures replication, and continuously applies the `DFLYCLUSTER CONFIG` payload to all nodes so that Redis/Valkey clients can discover the topology natively ([docs](https://www.dragonflydb.io/docs/managing-dragonfly/cluster-mode)).
 
 ```yaml
 apiVersion: dragonflydb.io/v1alpha1
@@ -60,18 +60,13 @@ metadata:
 spec:
   cluster:
     mode: MultiShard
-    shards:
-      - name: shard-a
-        replicas: 2        # 1 primary + 1 replica
-        slotRanges:
-          - start: 0
-            end: 8192
-      - name: shard-b
-        replicas: 2
-        slotRanges:
-          - start: 8192
-            end: 16384
+    shards: 2              # number of shards
+    replicasPerShard: 2    # 1 primary + 1 replica per shard (optional, defaults to 1)
 ```
+
+The operator automatically:
+- Creates StatefulSets named `dragonfly-cluster-shard-0`, `dragonfly-cluster-shard-1`, etc.
+- Assigns hash slots evenly (e.g., with 2 shards: shard-0 gets slots 0-8191, shard-1 gets slots 8192-16383)
 
 Clients should connect to the regular Service (`dragonfly-cluster.default` in this example); once the cluster configuration is applied, Redis cluster-aware drivers can route based on hash slots automatically.
 
@@ -134,6 +129,17 @@ To uninstall the operator, you can run
 
 ```sh
 kubectl delete -f https://raw.githubusercontent.com/dragonflydb/dragonfly-operator/main/manifests/dragonfly-operator.yaml
+```
+
+### Note regarding ipv6 only support
+
+You need to add those `args` in the dragonfly instance declaration in order to bind on ipv6.
+
+```sh
+  ...
+    - "--bind=::"
+    - "--admin_bind=::"
+  ...
 ```
 
 ## License

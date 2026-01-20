@@ -461,8 +461,8 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 			Expect(ss.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU].Equal(newResources.Requests[corev1.ResourceCPU])).To(BeTrue())
 			Expect(ss.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory].Equal(newResources.Requests[corev1.ResourceMemory])).To(BeTrue())
 
-			// check for annotations
-			Expect(ss.Spec.Template.ObjectMeta.Annotations).To(Equal(newAnnotations))
+			// check for annotations (allow additional operator-managed keys)
+			Expect(ss.Spec.Template.ObjectMeta.Annotations).To(HaveKeyWithValue("foo", "bar"))
 
 			// check for tolerations
 			Expect(ss.Spec.Template.Spec.Tolerations).To(Equal(newTolerations))
@@ -488,8 +488,8 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 				Expect(pod.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU].Equal(newResources.Requests[corev1.ResourceCPU])).To(BeTrue())
 				Expect(pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory].Equal(newResources.Requests[corev1.ResourceMemory])).To(BeTrue())
 
-				// check for annotations
-				Expect(pod.ObjectMeta.Annotations).To(Equal(newAnnotations))
+				// check for annotations (allow additional operator-managed keys)
+				Expect(pod.ObjectMeta.Annotations).To(HaveKeyWithValue("foo", "bar"))
 
 				// check for tolerations
 				Expect(pod.Spec.Tolerations).To(ContainElements(newTolerations))
@@ -1375,23 +1375,9 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 				Spec: resourcesv1.DragonflySpec{
 					Resources: &clusterResources,
 					Cluster: &resourcesv1.ClusterSpec{
-						Mode: resourcesv1.ClusterModeMultiShard,
-						Shards: []resourcesv1.ClusterShardSpec{
-							{
-								Name:     "shard-a",
-								Replicas: 1,
-								SlotRanges: []resourcesv1.SlotRange{
-									{Start: 0, End: 8191},
-								},
-							},
-							{
-								Name:     "shard-b",
-								Replicas: 1,
-								SlotRanges: []resourcesv1.SlotRange{
-									{Start: 8192, End: 16383},
-								},
-							},
-						},
+						Mode:             resourcesv1.ClusterModeMultiShard,
+						Shards:           2,
+						ReplicasPerShard: 1,
 					},
 				},
 			}
@@ -1405,8 +1391,8 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 			})
 
 			It("reconciles all shard statefulsets", func() {
-				for _, shard := range clusterSpec.Spec.Cluster.Shards {
-					stsName := fmt.Sprintf("%s-%s", clusterName, shard.Name)
+				for i := int32(0); i < clusterSpec.Spec.Cluster.Shards; i++ {
+					stsName := fmt.Sprintf("%s-shard-%d", clusterName, i)
 					err := waitForStatefulSetReady(ctx, k8sClient, stsName, namespace, 5*time.Minute)
 					Expect(err).To(BeNil(), "statefulset %s should be ready", stsName)
 				}
@@ -1425,8 +1411,9 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 				Expect(dfObj.Status.Cluster).ToNot(BeNil())
 				Expect(dfObj.Status.Cluster.ConfigHash).ToNot(BeEmpty())
 
-				for _, shard := range clusterSpec.Spec.Cluster.Shards {
-					headlessName := fmt.Sprintf("%s-%s-headless", clusterName, shard.Name)
+				for i := int32(0); i < clusterSpec.Spec.Cluster.Shards; i++ {
+					shardName := fmt.Sprintf("shard-%d", i)
+					headlessName := fmt.Sprintf("%s-%s-headless", clusterName, shardName)
 					var svc corev1.Service
 					err := k8sClient.Get(ctx, types.NamespacedName{
 						Name:      headlessName,
@@ -1435,7 +1422,7 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 					Expect(err).To(BeNil())
 					Expect(svc.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
 					Expect(svc.Spec.PublishNotReadyAddresses).To(BeTrue())
-					Expect(svc.Spec.Selector[resources.ShardNameLabelKey]).To(Equal(shard.Name))
+					Expect(svc.Spec.Selector[resources.ShardNameLabelKey]).To(Equal(shardName))
 				}
 
 				var clusterSvc corev1.Service
@@ -1452,12 +1439,84 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 					resources.DragonflyNameLabelKey: clusterName,
 				})
 				Expect(err).To(BeNil())
-				Expect(pods.Items).To(HaveLen(len(clusterSpec.Spec.Cluster.Shards)))
+				Expect(pods.Items).To(HaveLen(int(clusterSpec.Spec.Cluster.Shards)))
 
 				for _, pod := range pods.Items {
 					Expect(pod.Labels[resources.ShardNameLabelKey]).NotTo(BeEmpty(), "pod should carry shard label")
 					Expect(pod.Labels[resources.RoleLabelKey]).NotTo(BeEmpty(), "pod should carry role label")
 				}
+			})
+
+			It("applies cluster slot ranges on nodes", func() {
+				var pods corev1.PodList
+				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: clusterName,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).NotTo(BeEmpty())
+
+				targetPod := &pods.Items[0]
+				Eventually(func() ([]slotRange, error) {
+					return getClusterSlotRanges(ctx, clientset, cfg, targetPod, resources.DragonflyAdminPort)
+				}, 2*time.Minute, 5*time.Second).Should(WithTransform(func(ranges []slotRange) string {
+					if len(ranges) < 2 {
+						return fmt.Sprintf("len:%d", len(ranges))
+					}
+					return fmt.Sprintf("%d:%d,%d:%d", ranges[0].Start, ranges[0].End, ranges[1].Start, ranges[1].End)
+				}, Equal("0:8191,8192:16383")))
+			})
+
+			It("reapplies cluster config after a pod restart", func() {
+				var shardPods corev1.PodList
+				err := k8sClient.List(ctx, &shardPods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: clusterName,
+					resources.ShardNameLabelKey:     "shard-0",
+				})
+				Expect(err).To(BeNil())
+				Expect(shardPods.Items).NotTo(BeEmpty())
+
+				var targetPod *corev1.Pod
+				for i := range shardPods.Items {
+					if shardPods.Items[i].Labels[resources.RoleLabelKey] == resources.Master {
+						targetPod = &shardPods.Items[i]
+						break
+					}
+				}
+				if targetPod == nil {
+					targetPod = &shardPods.Items[0]
+				}
+
+				err = k8sClient.Delete(ctx, targetPod)
+				Expect(err).To(BeNil())
+
+				Eventually(func() (bool, error) {
+					var updatedPod corev1.Pod
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      targetPod.Name,
+						Namespace: namespace,
+					}, &updatedPod)
+					if err != nil {
+						return false, err
+					}
+					if updatedPod.Status.Phase != corev1.PodRunning {
+						return false, nil
+					}
+					for _, condition := range updatedPod.Status.Conditions {
+						if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+							return true, nil
+						}
+					}
+					return false, nil
+				}, 3*time.Minute, 5*time.Second).Should(BeTrue())
+
+				Eventually(func() ([]slotRange, error) {
+					return getClusterSlotRanges(ctx, clientset, cfg, targetPod, resources.DragonflyAdminPort)
+				}, 2*time.Minute, 5*time.Second).Should(WithTransform(func(ranges []slotRange) string {
+					if len(ranges) < 2 {
+						return fmt.Sprintf("len:%d", len(ranges))
+					}
+					return fmt.Sprintf("%d:%d,%d:%d", ranges[0].Start, ranges[0].End, ranges[1].Start, ranges[1].End)
+				}, Equal("0:8191,8192:16383")))
 			})
 
 			AfterAll(func() {

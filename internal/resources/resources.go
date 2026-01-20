@@ -34,19 +34,23 @@ var (
 )
 
 // GenerateDragonflyResources returns the resources required for a Dragonfly Instance.
-func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, error) {
+func GenerateDragonflyResources(df *resourcesv1.Dragonfly, defaultDragonflyImage string) ([]client.Object, error) {
 	if df.Spec.Cluster != nil && df.Spec.Cluster.Mode == resourcesv1.ClusterModeMultiShard {
-		return generateClusterResources(df)
+		return generateClusterResources(df, defaultDragonflyImage)
 	}
-	return generateStandaloneResources(df)
+	return generateStandaloneResources(df, defaultDragonflyImage)
 }
 
-func generateStandaloneResources(df *resourcesv1.Dragonfly) ([]client.Object, error) {
+func generateStandaloneResources(df *resourcesv1.Dragonfly, defaultDragonflyImage string) ([]client.Object, error) {
 	var resources []client.Object
 
 	image := df.Spec.Image
 	if image == "" {
-		image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
+		if defaultDragonflyImage != "" {
+			image = defaultDragonflyImage
+		} else {
+			image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
+		}
 	}
 
 	statefulset := buildStatefulSet(df, df.Name, df.Name, df.Spec.Replicas, nil, image)
@@ -146,23 +150,33 @@ func generateStandaloneResources(df *resourcesv1.Dragonfly) ([]client.Object, er
 	return resources, nil
 }
 
-func generateClusterResources(df *resourcesv1.Dragonfly) ([]client.Object, error) {
+func generateClusterResources(df *resourcesv1.Dragonfly, defaultDragonflyImage string) ([]client.Object, error) {
 	var resources []client.Object
 
 	image := df.Spec.Image
 	if image == "" {
-		image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
+		if defaultDragonflyImage != "" {
+			image = defaultDragonflyImage
+		} else {
+			image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
+		}
 	}
 
-	for _, shard := range df.Spec.Cluster.Shards {
+	replicasPerShard := df.Spec.Cluster.ReplicasPerShard
+	if replicasPerShard < 1 {
+		replicasPerShard = 1
+	}
+
+	for i := int32(0); i < df.Spec.Cluster.Shards; i++ {
+		shardName := fmt.Sprintf("shard-%d", i)
 		shardSelector := map[string]string{
-			ShardNameLabelKey: shard.Name,
+			ShardNameLabelKey: shardName,
 		}
 
-		serviceName := fmt.Sprintf("%s-%s-headless", df.Name, shard.Name)
-		statefulsetName := fmt.Sprintf("%s-%s", df.Name, shard.Name)
+		serviceName := fmt.Sprintf("%s-%s-headless", df.Name, shardName)
+		statefulsetName := fmt.Sprintf("%s-%s", df.Name, shardName)
 
-		statefulset := buildStatefulSet(df, statefulsetName, serviceName, shard.Replicas, shardSelector, image)
+		statefulset := buildStatefulSet(df, statefulsetName, serviceName, replicasPerShard, shardSelector, image)
 		if err := applyStatefulSetCustomizations(df, &statefulset); err != nil {
 			return nil, err
 		}
@@ -190,7 +204,7 @@ func generateClusterResources(df *resourcesv1.Dragonfly) ([]client.Object, error
 					DragonflyNameLabelKey:     df.Name,
 					KubernetesPartOfLabelKey:  KubernetesPartOf,
 					KubernetesAppNameLabelKey: KubernetesAppName,
-					ShardNameLabelKey:         shard.Name,
+					ShardNameLabelKey:         shardName,
 				},
 				Ports: []corev1.ServicePort{
 					{
@@ -210,10 +224,10 @@ func generateClusterResources(df *resourcesv1.Dragonfly) ([]client.Object, error
 
 		resources = append(resources, &shardService)
 
-		if shard.Replicas > 1 {
+		if replicasPerShard > 1 {
 			pdb := policyv1.PodDisruptionBudget{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        fmt.Sprintf("%s-%s", df.Name, shard.Name),
+					Name:        fmt.Sprintf("%s-%s", df.Name, shardName),
 					Namespace:   df.Namespace,
 					Labels:      generateResourceLabels(df),
 					Annotations: generateResourceAnnotations(df),
@@ -236,7 +250,7 @@ func generateClusterResources(df *resourcesv1.Dragonfly) ([]client.Object, error
 							DragonflyNameLabelKey:     df.Name,
 							KubernetesPartOfLabelKey:  KubernetesPartOf,
 							KubernetesAppNameLabelKey: KubernetesAppName,
-							ShardNameLabelKey:         shard.Name,
+							ShardNameLabelKey:         shardName,
 						},
 					},
 				},
@@ -513,8 +527,13 @@ func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *apps
 	}
 
 	if df.Spec.Snapshot != nil {
+		// validate mutual exclusivity of PVC spec and existing PVC name
+		if df.Spec.Snapshot.PersistentVolumeClaimSpec != nil && df.Spec.Snapshot.ExistingPersistentVolumeClaimName != "" {
+			return fmt.Errorf("persistentVolumeClaimSpec and existingPersistentVolumeClaimName are mutually exclusive")
+		}
+
 		// err if pvc is not specified & s3 sir is not present while cron is specified
-		if df.Spec.Snapshot.Cron != "" && df.Spec.Snapshot.PersistentVolumeClaimSpec == nil && df.Spec.Snapshot.Dir == "" {
+		if df.Spec.Snapshot.Cron != "" && df.Spec.Snapshot.PersistentVolumeClaimSpec == nil && df.Spec.Snapshot.ExistingPersistentVolumeClaimName == "" && df.Spec.Snapshot.Dir == "" {
 			return fmt.Errorf("cron specified without a persistent volume claim")
 		}
 
@@ -535,6 +554,23 @@ func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *apps
 					},
 				},
 				Spec: *df.Spec.Snapshot.PersistentVolumeClaimSpec,
+			})
+
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name:      SnapshotsVolumeName,
+				MountPath: snapshotDir,
+			})
+		}
+
+		if df.Spec.Snapshot.ExistingPersistentVolumeClaimName != "" {
+			// use an existing PVC
+			statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
+				Name: SnapshotsVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: df.Spec.Snapshot.ExistingPersistentVolumeClaimName,
+					},
+				},
 			})
 
 			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{

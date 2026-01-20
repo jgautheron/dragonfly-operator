@@ -77,28 +77,14 @@ func TestGenerateClusterResources(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "123"},
 		Spec: resourcesv1.DragonflySpec{
 			Cluster: &resourcesv1.ClusterSpec{
-				Mode: resourcesv1.ClusterModeMultiShard,
-				Shards: []resourcesv1.ClusterShardSpec{
-					{
-						Name:     "shard-a",
-						Replicas: 1,
-						SlotRanges: []resourcesv1.SlotRange{
-							{Start: 0, End: 8192},
-						},
-					},
-					{
-						Name:     "shard-b",
-						Replicas: 1,
-						SlotRanges: []resourcesv1.SlotRange{
-							{Start: 8192, End: 16384},
-						},
-					},
-				},
+				Mode:             resourcesv1.ClusterModeMultiShard,
+				Shards:           2,
+				ReplicasPerShard: 1,
 			},
 		},
 	}
 
-	objs, err := GenerateDragonflyResources(df)
+	objs, err := GenerateDragonflyResources(df, "")
 	assert.NoError(t, err)
 
 	var stsCount, serviceCount int
