@@ -18,6 +18,7 @@ package resources
 
 import (
 	"fmt"
+	"strings"
 
 	resourcesv1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -32,9 +33,15 @@ var (
 	dflyUserGroup int64 = 999
 )
 
-// GenerateDragonflyResources returns the resources required for a Dragonfly
-// Instance
+// GenerateDragonflyResources returns the resources required for a Dragonfly Instance.
 func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, error) {
+	if df.Spec.Cluster != nil && df.Spec.Cluster.Mode == resourcesv1.ClusterModeMultiShard {
+		return generateClusterResources(df)
+	}
+	return generateStandaloneResources(df)
+}
+
+func generateStandaloneResources(df *resourcesv1.Dragonfly) ([]client.Object, error) {
 	var resources []client.Object
 
 	image := df.Spec.Image
@@ -42,338 +49,11 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, err
 		image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
 	}
 
-	// Create a StatefulSet, Headless Service
-	statefulset := appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      df.Name,
-			Namespace: df.Namespace,
-			// Useful for automatically deleting the resources when the Dragonfly object is deleted
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: df.APIVersion,
-					Kind:       df.Kind,
-					Name:       df.Name,
-					UID:        df.UID,
-				},
-			},
-			Labels:      generateResourceLabels(df),
-			Annotations: generateResourceAnnotations(df),
-		},
-		Spec: appsv1.StatefulSetSpec{
-			Replicas:    &df.Spec.Replicas,
-			ServiceName: df.Name,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					DragonflyNameLabelKey:     df.Name,
-					KubernetesPartOfLabelKey:  KubernetesPartOf,
-					KubernetesAppNameLabelKey: KubernetesAppName,
-				},
-			},
-			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
-				Type: appsv1.OnDeleteStatefulSetStrategyType,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						DragonflyNameLabelKey:     df.Name,
-						KubernetesPartOfLabelKey:  KubernetesPartOf,
-						KubernetesAppNameLabelKey: KubernetesAppName,
-					},
-				},
-				Spec: corev1.PodSpec{
-					ImagePullSecrets: df.Spec.ImagePullSecrets,
-					Containers: []corev1.Container{
-						{
-							Name:  DragonflyContainerName,
-							Image: image,
-							Ports: []corev1.ContainerPort{
-								{
-									Name:          DragonflyPortName,
-									ContainerPort: DragonflyPort,
-								},
-								{
-									Name:          DragonflyAdminPortName,
-									ContainerPort: DragonflyAdminPort,
-								},
-							},
-							Args: DefaultDragonflyArgs,
-							Env: append(df.Spec.Env, corev1.EnvVar{
-								Name:  "HEALTHCHECK_PORT",
-								Value: fmt.Sprintf("%d", DragonflyAdminPort),
-							}),
-							ReadinessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									Exec: &corev1.ExecAction{
-										Command: []string{
-											"/bin/sh",
-											"/usr/local/bin/healthcheck.sh",
-										},
-									},
-								},
-								FailureThreshold:    3,
-								InitialDelaySeconds: 10,
-								PeriodSeconds:       10,
-								SuccessThreshold:    1,
-								TimeoutSeconds:      5,
-							},
-							LivenessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									Exec: &corev1.ExecAction{
-										Command: []string{
-											"/bin/sh",
-											"/usr/local/bin/healthcheck.sh",
-										},
-									},
-								},
-								FailureThreshold:    3,
-								InitialDelaySeconds: 10,
-								PeriodSeconds:       10,
-								SuccessThreshold:    1,
-								TimeoutSeconds:      5,
-							},
-							ImagePullPolicy: df.Spec.ImagePullPolicy,
-						},
-					},
-				},
-			},
-		},
+	statefulset := buildStatefulSet(df, df.Name, df.Name, df.Spec.Replicas, nil, image)
+
+	if err := applyStatefulSetCustomizations(df, &statefulset); err != nil {
+		return nil, err
 	}
-
-	if len(df.Spec.InitContainers) > 0 {
-		statefulset.Spec.Template.Spec.InitContainers = df.Spec.InitContainers
-	}
-
-	// Skip Assigning FileSystem Group. Required for platforms such as Openshift that require IDs to not be set, as it injects a fixed randomized ID per namespace into all pods.
-	// Skip Assigning FileSystem Group if podSecurityContext is set as well.
-	if !df.Spec.SkipFSGroup && df.Spec.PodSecurityContext == nil {
-		statefulset.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
-			FSGroup: &dflyUserGroup,
-		}
-	}
-
-	// set podSecurityContext if one is specified
-	if df.Spec.PodSecurityContext != nil {
-		statefulset.Spec.Template.Spec.SecurityContext = df.Spec.PodSecurityContext
-	}
-
-	// set containerSecurityContext if one is specified
-	if df.Spec.ContainerSecurityContext != nil {
-		statefulset.Spec.Template.Spec.Containers[0].SecurityContext = df.Spec.ContainerSecurityContext
-	}
-
-	// set only if resources are specified
-	if df.Spec.Resources != nil {
-		statefulset.Spec.Template.Spec.Containers[0].Resources = *df.Spec.Resources
-	}
-
-	if df.Spec.Args != nil {
-		statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, df.Spec.Args...)
-	}
-	if df.Spec.MemcachedPort != 0 {
-		statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("%s=%d", MemcachedPortArg, df.Spec.MemcachedPort))
-		statefulset.Spec.Template.Spec.Containers[0].Ports = append(statefulset.Spec.Template.Spec.Containers[0].Ports, corev1.ContainerPort{
-			Name:          MemcachedPortName,
-			ContainerPort: df.Spec.MemcachedPort,
-		})
-	}
-
-	if df.Spec.AclFromSecret != nil {
-		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: AclVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: df.Spec.AclFromSecret.Name,
-					Items: []corev1.KeyToPath{
-						{
-							Key:  df.Spec.AclFromSecret.Key,
-							Path: AclFileName,
-						},
-					},
-				},
-			},
-		})
-
-		statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = append(statefulset.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
-			Name:      AclVolumeName,
-			MountPath: AclDir,
-		})
-
-		statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("%s=%s/%s", AclFileArg, AclDir, AclFileName))
-	}
-
-	// Doc: https://www.dragonflydb.io/blog/a-preview-of-dragonfly-ssd-tiering
-	if df.Spec.Tiering != nil {
-
-		tieringVolumeName := "tiering"
-		tieringMountName := "/dragonfly/tiering"
-		tieringDirName := "vol"
-
-		if df.Spec.Tiering.PersistentVolumeClaimSpec != nil {
-			statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates, corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        tieringVolumeName,
-					Labels:      generateResourceLabels(df),
-					Annotations: generateResourceAnnotations(df),
-				},
-				Spec: *df.Spec.Tiering.PersistentVolumeClaimSpec,
-			})
-
-			statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-				statefulset.Spec.Template.Spec.Containers[0].VolumeMounts,
-				corev1.VolumeMount{
-					Name:      tieringVolumeName,
-					MountPath: tieringMountName,
-				},
-			)
-		}
-
-		statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("--tiered_prefix=%s/%s", tieringMountName, tieringDirName))
-	}
-
-	if df.Spec.Snapshot != nil {
-		// err if pvc is not specified & s3 sir is not present while cron is specified
-		if df.Spec.Snapshot.Cron != "" && df.Spec.Snapshot.PersistentVolumeClaimSpec == nil && df.Spec.Snapshot.Dir == "" {
-			return nil, fmt.Errorf("cron specified without a persistent volume claim")
-		}
-
-		snapshotDir := df.Spec.Snapshot.Dir
-		if df.Spec.Snapshot.Dir == "" {
-			snapshotDir = SnapshotsDir
-		}
-
-		if df.Spec.Snapshot.PersistentVolumeClaimSpec != nil {
-			// attach and use the PVC if specified
-			statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates, corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: SnapshotsVolumeName,
-					Labels: map[string]string{
-						DragonflyNameLabelKey:     df.Name,
-						KubernetesPartOfLabelKey:  KubernetesPartOf,
-						KubernetesAppNameLabelKey: KubernetesAppName,
-					},
-				},
-				Spec: *df.Spec.Snapshot.PersistentVolumeClaimSpec,
-			})
-
-			statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = append(statefulset.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
-				Name:      SnapshotsVolumeName,
-				MountPath: snapshotDir,
-			})
-		}
-
-		statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("%s=%s", SnapshotsDirArg, snapshotDir))
-
-		if df.Spec.Snapshot.Cron != "" {
-			statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("%s=%s", SnapshotsCronArg, df.Spec.Snapshot.Cron))
-		}
-	}
-
-	if df.Spec.TLSSecretRef != nil {
-		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: TLSVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: df.Spec.TLSSecretRef.Name,
-				},
-			},
-		})
-
-		statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = append(statefulset.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
-			Name:      TLSVolumeName,
-			ReadOnly:  true,
-			MountPath: TLSDir,
-		})
-
-		statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, []string{
-			// no TLS on admin port by default
-			NoTLSOnAdminPortArg,
-			TLSArg,
-			fmt.Sprintf("%s=%s/%s", TLSCertPathArg, TLSDir, TLSCertFileName),
-			fmt.Sprintf("%s=%s/%s", TLSKeyPathArg, TLSDir, TLSKeyFileName),
-		}...)
-	}
-
-	if df.Spec.Annotations != nil {
-		statefulset.Spec.Template.ObjectMeta.Annotations = df.Spec.Annotations
-	}
-
-	for key := range df.Spec.Labels {
-		// Make sure we do not overwrite any existing labels
-		if _, ok := statefulset.Spec.Template.ObjectMeta.Labels[key]; !ok {
-			statefulset.Spec.Template.ObjectMeta.Labels[key] = df.Spec.Labels[key]
-		}
-	}
-
-	if df.Spec.Affinity != nil {
-		statefulset.Spec.Template.Spec.Affinity = df.Spec.Affinity
-	}
-
-	if df.Spec.NodeSelector != nil {
-		statefulset.Spec.Template.Spec.NodeSelector = df.Spec.NodeSelector
-	}
-
-	if df.Spec.Tolerations != nil {
-		statefulset.Spec.Template.Spec.Tolerations = df.Spec.Tolerations
-	}
-
-	if df.Spec.TopologySpreadConstraints != nil {
-		statefulset.Spec.Template.Spec.TopologySpreadConstraints = df.Spec.TopologySpreadConstraints
-	}
-
-	if df.Spec.ServiceAccountName != "" {
-		statefulset.Spec.Template.Spec.ServiceAccountName = df.Spec.ServiceAccountName
-	}
-
-	if df.Spec.PriorityClassName != "" {
-		statefulset.Spec.Template.Spec.PriorityClassName = df.Spec.PriorityClassName
-	}
-
-	if df.Spec.Authentication != nil {
-		if df.Spec.Authentication.PasswordFromSecret != nil {
-			// load the secret key as a password into env
-			statefulset.Spec.Template.Spec.Containers[0].Env = append(statefulset.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
-				Name: "DFLY_requirepass",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: df.Spec.Authentication.PasswordFromSecret,
-				},
-			})
-		}
-
-		if df.Spec.Authentication.ClientCaCertSecret != nil {
-			// mount the secrets as a volume
-			statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
-				Name: TLSCACertVolumeName,
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: df.Spec.Authentication.ClientCaCertSecret.Name,
-						Items: []corev1.KeyToPath{
-							{
-								Key:  df.Spec.Authentication.ClientCaCertSecret.Key,
-								Path: TLSCACertFileName,
-							},
-						},
-					},
-				},
-			})
-
-			// mount it
-			statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = append(statefulset.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
-				Name:      TLSCACertVolumeName,
-				MountPath: TLSCACertDir,
-			})
-
-			// pass it as an arg
-			statefulset.Spec.Template.Spec.Containers[0].Args = append(statefulset.Spec.Template.Spec.Containers[0].Args, fmt.Sprintf("%s=%s/%s", TLSCACertPathArg, TLSCACertDir, TLSCACertFileName))
-		}
-	}
-
-	statefulset.Spec.Template.Spec.Containers = mergeNamedSlices(
-		statefulset.Spec.Template.Spec.Containers, df.Spec.AdditionalContainers,
-		func(c corev1.Container) string { return c.Name })
-
-	statefulset.Spec.Template.Spec.Volumes = mergeNamedSlices(
-		statefulset.Spec.Template.Spec.Volumes, df.Spec.AdditionalVolumes,
-		func(v corev1.Volume) string { return v.Name })
 
 	resources = append(resources, &statefulset)
 
@@ -464,6 +144,541 @@ func GenerateDragonflyResources(df *resourcesv1.Dragonfly) ([]client.Object, err
 	}
 
 	return resources, nil
+}
+
+func generateClusterResources(df *resourcesv1.Dragonfly) ([]client.Object, error) {
+	var resources []client.Object
+
+	image := df.Spec.Image
+	if image == "" {
+		image = fmt.Sprintf("%s:%s", DragonflyImage, Version)
+	}
+
+	for _, shard := range df.Spec.Cluster.Shards {
+		shardSelector := map[string]string{
+			ShardNameLabelKey: shard.Name,
+		}
+
+		serviceName := fmt.Sprintf("%s-%s-headless", df.Name, shard.Name)
+		statefulsetName := fmt.Sprintf("%s-%s", df.Name, shard.Name)
+
+		statefulset := buildStatefulSet(df, statefulsetName, serviceName, shard.Replicas, shardSelector, image)
+		if err := applyStatefulSetCustomizations(df, &statefulset); err != nil {
+			return nil, err
+		}
+		resources = append(resources, &statefulset)
+
+		shardService := corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        serviceName,
+				Namespace:   df.Namespace,
+				Labels:      generateResourceLabels(df),
+				Annotations: generateResourceAnnotations(df),
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: df.APIVersion,
+						Kind:       df.Kind,
+						Name:       df.Name,
+						UID:        df.UID,
+					},
+				},
+			},
+			Spec: corev1.ServiceSpec{
+				ClusterIP:                corev1.ClusterIPNone,
+				PublishNotReadyAddresses: true,
+				Selector: map[string]string{
+					DragonflyNameLabelKey:     df.Name,
+					KubernetesPartOfLabelKey:  KubernetesPartOf,
+					KubernetesAppNameLabelKey: KubernetesAppName,
+					ShardNameLabelKey:         shard.Name,
+				},
+				Ports: []corev1.ServicePort{
+					{
+						Name: DragonflyPortName,
+						Port: DragonflyPort,
+					},
+				},
+			},
+		}
+
+		if df.Spec.MemcachedPort != 0 {
+			shardService.Spec.Ports = append(shardService.Spec.Ports, corev1.ServicePort{
+				Name: MemcachedPortName,
+				Port: df.Spec.MemcachedPort,
+			})
+		}
+
+		resources = append(resources, &shardService)
+
+		if shard.Replicas > 1 {
+			pdb := policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        fmt.Sprintf("%s-%s", df.Name, shard.Name),
+					Namespace:   df.Namespace,
+					Labels:      generateResourceLabels(df),
+					Annotations: generateResourceAnnotations(df),
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: df.APIVersion,
+							Kind:       df.Kind,
+							Name:       df.Name,
+							UID:        df.UID,
+						},
+					},
+				},
+				Spec: policyv1.PodDisruptionBudgetSpec{
+					MaxUnavailable: &intstr.IntOrString{
+						Type:   intstr.Int,
+						IntVal: 1,
+					},
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							DragonflyNameLabelKey:     df.Name,
+							KubernetesPartOfLabelKey:  KubernetesPartOf,
+							KubernetesAppNameLabelKey: KubernetesAppName,
+							ShardNameLabelKey:         shard.Name,
+						},
+					},
+				},
+			}
+			resources = append(resources, &pdb)
+		}
+	}
+
+	serviceName := df.Name
+	if df.Spec.ServiceSpec != nil && df.Spec.ServiceSpec.Name != "" {
+		serviceName = df.Spec.ServiceSpec.Name
+	}
+
+	clusterService := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        serviceName,
+			Namespace:   df.Namespace,
+			Labels:      generateResourceLabels(df),
+			Annotations: generateResourceAnnotations(df),
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: df.APIVersion,
+					Kind:       df.Kind,
+					Name:       df.Name,
+					UID:        df.UID,
+				},
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{
+				DragonflyNameLabelKey:     df.Name,
+				KubernetesAppNameLabelKey: KubernetesAppName,
+			},
+			Ports: []corev1.ServicePort{
+				{
+					Name: DragonflyPortName,
+					Port: DragonflyPort,
+				},
+			},
+		},
+	}
+
+	if df.Spec.ServiceSpec != nil {
+		clusterService.Spec.Type = df.Spec.ServiceSpec.Type
+		clusterService.Annotations = df.Spec.ServiceSpec.Annotations
+		clusterService.Labels = df.Spec.ServiceSpec.Labels
+		clusterService.Spec.Ports[0].NodePort = df.Spec.ServiceSpec.NodePort
+	}
+
+	if df.Spec.MemcachedPort != 0 {
+		clusterService.Spec.Ports = append(clusterService.Spec.Ports, corev1.ServicePort{
+			Name: MemcachedPortName,
+			Port: df.Spec.MemcachedPort,
+		})
+	}
+
+	resources = append(resources, &clusterService)
+
+	return resources, nil
+}
+
+func buildStatefulSet(df *resourcesv1.Dragonfly, name, serviceName string, replicas int32, selectorLabels map[string]string, image string) appsv1.StatefulSet {
+	replicasCopy := replicas
+	if replicasCopy < 1 {
+		replicasCopy = 1
+	}
+
+	matchLabels := map[string]string{
+		DragonflyNameLabelKey:     df.Name,
+		KubernetesPartOfLabelKey:  KubernetesPartOf,
+		KubernetesAppNameLabelKey: KubernetesAppName,
+	}
+
+	for k, v := range selectorLabels {
+		matchLabels[k] = v
+	}
+
+	templateLabels := make(map[string]string, len(matchLabels))
+	for k, v := range matchLabels {
+		templateLabels[k] = v
+	}
+
+	statefulset := appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: df.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: df.APIVersion,
+					Kind:       df.Kind,
+					Name:       df.Name,
+					UID:        df.UID,
+				},
+			},
+			Labels:      generateResourceLabels(df),
+			Annotations: generateResourceAnnotations(df),
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:    &replicasCopy,
+			ServiceName: serviceName,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: matchLabels,
+			},
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.OnDeleteStatefulSetStrategyType,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: templateLabels,
+				},
+				Spec: corev1.PodSpec{
+					ImagePullSecrets: df.Spec.ImagePullSecrets,
+					Containers: []corev1.Container{
+						{
+							Name:  DragonflyContainerName,
+							Image: image,
+							Ports: []corev1.ContainerPort{
+								{
+									Name:          DragonflyPortName,
+									ContainerPort: DragonflyPort,
+								},
+								{
+									Name:          DragonflyAdminPortName,
+									ContainerPort: DragonflyAdminPort,
+								},
+							},
+							Args: append([]string{}, DefaultDragonflyArgs...),
+							Env: append(append([]corev1.EnvVar{}, df.Spec.Env...), corev1.EnvVar{
+								Name:  "HEALTHCHECK_PORT",
+								Value: fmt.Sprintf("%d", DragonflyAdminPort),
+							}),
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									Exec: &corev1.ExecAction{
+										Command: []string{
+											"/bin/sh",
+											"/usr/local/bin/healthcheck.sh",
+										},
+									},
+								},
+								FailureThreshold:    3,
+								InitialDelaySeconds: 10,
+								PeriodSeconds:       10,
+								SuccessThreshold:    1,
+								TimeoutSeconds:      5,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									Exec: &corev1.ExecAction{
+										Command: []string{
+											"/bin/sh",
+											"/usr/local/bin/healthcheck.sh",
+										},
+									},
+								},
+								FailureThreshold:    3,
+								InitialDelaySeconds: 10,
+								PeriodSeconds:       10,
+								SuccessThreshold:    1,
+								TimeoutSeconds:      5,
+							},
+							ImagePullPolicy: df.Spec.ImagePullPolicy,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return statefulset
+}
+
+func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *appsv1.StatefulSet) error {
+	container := &statefulset.Spec.Template.Spec.Containers[0]
+
+	if len(df.Spec.InitContainers) > 0 {
+		statefulset.Spec.Template.Spec.InitContainers = df.Spec.InitContainers
+	}
+
+	// Skip Assigning FileSystem Group. Required for platforms such as Openshift that require IDs to not be set, as it injects a fixed randomized ID per namespace into all pods.
+	// Skip Assigning FileSystem Group if podSecurityContext is set as well.
+	if !df.Spec.SkipFSGroup && df.Spec.PodSecurityContext == nil {
+		statefulset.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+			FSGroup: &dflyUserGroup,
+		}
+	}
+
+	// set podSecurityContext if one is specified
+	if df.Spec.PodSecurityContext != nil {
+		statefulset.Spec.Template.Spec.SecurityContext = df.Spec.PodSecurityContext
+	}
+
+	// set containerSecurityContext if one is specified
+	if df.Spec.ContainerSecurityContext != nil {
+		container.SecurityContext = df.Spec.ContainerSecurityContext
+	}
+
+	// set only if resources are specified
+	if df.Spec.Resources != nil {
+		container.Resources = *df.Spec.Resources
+	}
+
+	if df.Spec.Args != nil {
+		container.Args = append(container.Args, df.Spec.Args...)
+	}
+
+	if df.Spec.Cluster != nil && df.Spec.Cluster.Mode == resourcesv1.ClusterModeMultiShard {
+		container.Args = append(container.Args, fmt.Sprintf("%s=yes", ClusterModeArg))
+		if df.Spec.Cluster.AdminPort != 0 {
+			container.Args = upsertArg(container.Args, "--admin_port=", fmt.Sprintf("--admin_port=%d", df.Spec.Cluster.AdminPort))
+			upsertEnvVar(&container.Env, "HEALTHCHECK_PORT", fmt.Sprintf("%d", df.Spec.Cluster.AdminPort))
+		}
+	}
+
+	if df.Spec.MemcachedPort != 0 {
+		container.Args = append(container.Args, fmt.Sprintf("%s=%d", MemcachedPortArg, df.Spec.MemcachedPort))
+		container.Ports = append(container.Ports, corev1.ContainerPort{
+			Name:          MemcachedPortName,
+			ContainerPort: df.Spec.MemcachedPort,
+		})
+	}
+
+	if df.Spec.AclFromSecret != nil {
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: AclVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: df.Spec.AclFromSecret.Name,
+					Items: []corev1.KeyToPath{
+						{
+							Key:  df.Spec.AclFromSecret.Key,
+							Path: AclFileName,
+						},
+					},
+				},
+			},
+		})
+
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      AclVolumeName,
+			MountPath: AclDir,
+		})
+
+		container.Args = append(container.Args, fmt.Sprintf("%s=%s/%s", AclFileArg, AclDir, AclFileName))
+	}
+
+	// Doc: https://www.dragonflydb.io/blog/a-preview-of-dragonfly-ssd-tiering
+	if df.Spec.Tiering != nil {
+
+		tieringVolumeName := "tiering"
+		tieringMountName := "/dragonfly/tiering"
+		tieringDirName := "vol"
+
+		if df.Spec.Tiering.PersistentVolumeClaimSpec != nil {
+			statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates, corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        tieringVolumeName,
+					Labels:      generateResourceLabels(df),
+					Annotations: generateResourceAnnotations(df),
+				},
+				Spec: *df.Spec.Tiering.PersistentVolumeClaimSpec,
+			})
+
+			container.VolumeMounts = append(
+				container.VolumeMounts,
+				corev1.VolumeMount{
+					Name:      tieringVolumeName,
+					MountPath: tieringMountName,
+				},
+			)
+		}
+
+		container.Args = append(container.Args, fmt.Sprintf("--tiered_prefix=%s/%s", tieringMountName, tieringDirName))
+	}
+
+	if df.Spec.Snapshot != nil {
+		// err if pvc is not specified & s3 sir is not present while cron is specified
+		if df.Spec.Snapshot.Cron != "" && df.Spec.Snapshot.PersistentVolumeClaimSpec == nil && df.Spec.Snapshot.Dir == "" {
+			return fmt.Errorf("cron specified without a persistent volume claim")
+		}
+
+		snapshotDir := df.Spec.Snapshot.Dir
+		if df.Spec.Snapshot.Dir == "" {
+			snapshotDir = SnapshotsDir
+		}
+
+		if df.Spec.Snapshot.PersistentVolumeClaimSpec != nil {
+			// attach and use the PVC if specified
+			statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates, corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: SnapshotsVolumeName,
+					Labels: map[string]string{
+						DragonflyNameLabelKey:     df.Name,
+						KubernetesPartOfLabelKey:  KubernetesPartOf,
+						KubernetesAppNameLabelKey: KubernetesAppName,
+					},
+				},
+				Spec: *df.Spec.Snapshot.PersistentVolumeClaimSpec,
+			})
+
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name:      SnapshotsVolumeName,
+				MountPath: snapshotDir,
+			})
+		}
+
+		container.Args = append(container.Args, fmt.Sprintf("%s=%s", SnapshotsDirArg, snapshotDir))
+
+		if df.Spec.Snapshot.Cron != "" {
+			container.Args = append(container.Args, fmt.Sprintf("%s=%s", SnapshotsCronArg, df.Spec.Snapshot.Cron))
+		}
+	}
+
+	if df.Spec.TLSSecretRef != nil {
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: TLSVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: df.Spec.TLSSecretRef.Name,
+				},
+			},
+		})
+
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      TLSVolumeName,
+			ReadOnly:  true,
+			MountPath: TLSDir,
+		})
+
+		container.Args = append(container.Args, []string{
+			// no TLS on admin port by default
+			NoTLSOnAdminPortArg,
+			TLSArg,
+			fmt.Sprintf("%s=%s/%s", TLSCertPathArg, TLSDir, TLSCertFileName),
+			fmt.Sprintf("%s=%s/%s", TLSKeyPathArg, TLSDir, TLSKeyFileName),
+		}...)
+	}
+
+	if df.Spec.Annotations != nil {
+		statefulset.Spec.Template.ObjectMeta.Annotations = df.Spec.Annotations
+	}
+
+	for key := range df.Spec.Labels {
+		// Make sure we do not overwrite any existing labels
+		if _, ok := statefulset.Spec.Template.ObjectMeta.Labels[key]; !ok {
+			statefulset.Spec.Template.ObjectMeta.Labels[key] = df.Spec.Labels[key]
+		}
+	}
+
+	if df.Spec.Affinity != nil {
+		statefulset.Spec.Template.Spec.Affinity = df.Spec.Affinity
+	}
+
+	if df.Spec.NodeSelector != nil {
+		statefulset.Spec.Template.Spec.NodeSelector = df.Spec.NodeSelector
+	}
+
+	if df.Spec.Tolerations != nil {
+		statefulset.Spec.Template.Spec.Tolerations = df.Spec.Tolerations
+	}
+
+	if df.Spec.TopologySpreadConstraints != nil {
+		statefulset.Spec.Template.Spec.TopologySpreadConstraints = df.Spec.TopologySpreadConstraints
+	}
+
+	if df.Spec.ServiceAccountName != "" {
+		statefulset.Spec.Template.Spec.ServiceAccountName = df.Spec.ServiceAccountName
+	}
+
+	if df.Spec.PriorityClassName != "" {
+		statefulset.Spec.Template.Spec.PriorityClassName = df.Spec.PriorityClassName
+	}
+
+	if df.Spec.Authentication != nil {
+		if df.Spec.Authentication.PasswordFromSecret != nil {
+			// load the secret key as a password into env
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name: "DFLY_requirepass",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: df.Spec.Authentication.PasswordFromSecret,
+				},
+			})
+		}
+
+		if df.Spec.Authentication.ClientCaCertSecret != nil {
+			// mount the secrets as a volume
+			statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, corev1.Volume{
+				Name: TLSCACertVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: df.Spec.Authentication.ClientCaCertSecret.Name,
+						Items: []corev1.KeyToPath{
+							{
+								Key:  df.Spec.Authentication.ClientCaCertSecret.Key,
+								Path: TLSCACertFileName,
+							},
+						},
+					},
+				},
+			})
+
+			// mount it
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name:      TLSCACertVolumeName,
+				MountPath: TLSCACertDir,
+			})
+
+			// pass it as an arg
+			container.Args = append(container.Args, fmt.Sprintf("%s=%s/%s", TLSCACertPathArg, TLSCACertDir, TLSCACertFileName))
+		}
+	}
+
+	statefulset.Spec.Template.Spec.Containers = mergeNamedSlices(
+		statefulset.Spec.Template.Spec.Containers, df.Spec.AdditionalContainers,
+		func(c corev1.Container) string { return c.Name })
+
+	statefulset.Spec.Template.Spec.Volumes = mergeNamedSlices(
+		statefulset.Spec.Template.Spec.Volumes, df.Spec.AdditionalVolumes,
+		func(v corev1.Volume) string { return v.Name })
+
+	return nil
+}
+
+func upsertArg(args []string, prefix, newValue string) []string {
+	for i, arg := range args {
+		if strings.HasPrefix(arg, prefix) {
+			args[i] = newValue
+			return args
+		}
+	}
+	return append(args, newValue)
+}
+
+func upsertEnvVar(envs *[]corev1.EnvVar, name, value string) {
+	for i := range *envs {
+		if (*envs)[i].Name == name {
+			(*envs)[i].Value = value
+			(*envs)[i].ValueFrom = nil
+			return
+		}
+	}
+	*envs = append(*envs, corev1.EnvVar{Name: name, Value: value})
 }
 
 // mergeNamedSlices will merge base into override, override takes precendence

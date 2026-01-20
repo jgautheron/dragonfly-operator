@@ -32,6 +32,12 @@ type DragonflySpec struct {
 	// Replicas is the total number of Dragonfly instances including the master
 	Replicas int32 `json:"replicas,omitempty"`
 
+	// (Optional) Cluster configuration. When provided, the operator deploys Dragonfly
+	// in real cluster mode and ignores the global Replicas count.
+	// +optional
+	// +kubebuilder:validation:Optional
+	Cluster *ClusterSpec `json:"cluster,omitempty"`
+
 	// Image is the Dragonfly image to use
 	Image string `json:"image,omitempty"`
 
@@ -176,6 +182,59 @@ type DragonflySpec struct {
 	OwnedObjectsMetadata *OwnedObjectsMetadata `json:"ownedObjectsMetadata,omitempty"`
 }
 
+// ClusterMode indicates which Dragonfly cluster mode should be used.
+type ClusterMode string
+
+const (
+	// ClusterModeEmulated uses the legacy single-master replication mode.
+	ClusterModeEmulated ClusterMode = "Emulated"
+	// ClusterModeMultiShard provisions Dragonfly in real multi-shard cluster mode.
+	ClusterModeMultiShard ClusterMode = "MultiShard"
+)
+
+// ClusterSpec describes the desired real cluster topology.
+type ClusterSpec struct {
+	// Mode selects the Dragonfly cluster mode implementation.
+	// +kubebuilder:validation:Enum=Emulated;MultiShard
+	Mode ClusterMode `json:"mode"`
+
+	// AdminPort overrides the admin port used for cluster commands.
+	// Defaults to 9999 when unset.
+	// +optional
+	// +kubebuilder:default:=9999
+	AdminPort int32 `json:"adminPort,omitempty"`
+
+	// Shards lists the desired shard layout. Each shard maps to a primary node
+	// with optional replicas that share the same slot ranges.
+	// +kubebuilder:validation:MinItems=1
+	Shards []ClusterShardSpec `json:"shards"`
+}
+
+// ClusterShardSpec declares a shard topology.
+type ClusterShardSpec struct {
+	// Name is appended to managed resource names for determinism.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// SlotRanges denotes the hash slots served by this shard.
+	// +kubebuilder:validation:MinItems=1
+	SlotRanges []SlotRange `json:"slotRanges"`
+
+	// Replicas is the total number of nodes in this shard (1 == primary only).
+	// +kubebuilder:validation:Minimum=1
+	Replicas int32 `json:"replicas"`
+}
+
+// SlotRange describes a half-open hash slot interval owned by a shard.
+type SlotRange struct {
+	// Start inclusive slot index.
+	// +kubebuilder:validation:Minimum=0
+	Start int32 `json:"start"`
+	// End exclusive slot index.
+	// +kubebuilder:validation:Maximum=16384
+	End int32 `json:"end"`
+}
+
 type OwnedObjectsMetadata struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
@@ -265,6 +324,22 @@ type DragonflyStatus struct {
 	// TODO: remove this in a future release.
 	// IsRollingUpdate is true if the Dragonfly instance is being updated
 	IsRollingUpdate bool `json:"isRollingUpdate,omitempty"`
+
+	// Cluster holds details about the current cluster configuration state.
+	// +optional
+	Cluster *ClusterStatus `json:"cluster,omitempty"`
+
+	// Conditions provides high-level state tracking.
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ClusterStatus tracks the multi-shard cluster state.
+type ClusterStatus struct {
+	// ConfigHash is the hash of the last applied DFLYCLUSTER CONFIG payload.
+	ConfigHash string `json:"configHash,omitempty"`
+	// ObservedGeneration indicates which spec revision the status represents.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 //+kubebuilder:object:root=true

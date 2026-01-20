@@ -1355,6 +1355,133 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 			Expect(err).To(BeNil(), "cluster should be Ready only after dataset loading completes")
 		})
 
+		Context("Multi-shard cluster mode", Ordered, func() {
+			clusterName := "df-cluster-mode"
+			clusterResources := corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+					corev1.ResourceMemory: resource.MustParse("400Mi"),
+				},
+			}
+			clusterSpec := resourcesv1.Dragonfly{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: namespace,
+				},
+				Spec: resourcesv1.DragonflySpec{
+					Resources: &clusterResources,
+					Cluster: &resourcesv1.ClusterSpec{
+						Mode: resourcesv1.ClusterModeMultiShard,
+						Shards: []resourcesv1.ClusterShardSpec{
+							{
+								Name:     "shard-a",
+								Replicas: 1,
+								SlotRanges: []resourcesv1.SlotRange{
+									{Start: 0, End: 8191},
+								},
+							},
+							{
+								Name:     "shard-b",
+								Replicas: 1,
+								SlotRanges: []resourcesv1.SlotRange{
+									{Start: 8192, End: 16383},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			It("creates the multi-shard cluster resource", func() {
+				err := k8sClient.Create(ctx, clusterSpec.DeepCopy())
+				Expect(err).To(BeNil())
+
+				err = waitForDragonflyPhase(ctx, k8sClient, clusterName, namespace, controller.PhaseResourcesCreated, 3*time.Minute)
+				Expect(err).To(BeNil())
+			})
+
+			It("reconciles all shard statefulsets", func() {
+				for _, shard := range clusterSpec.Spec.Cluster.Shards {
+					stsName := fmt.Sprintf("%s-%s", clusterName, shard.Name)
+					err := waitForStatefulSetReady(ctx, k8sClient, stsName, namespace, 5*time.Minute)
+					Expect(err).To(BeNil(), "statefulset %s should be ready", stsName)
+				}
+
+				err := waitForDragonflyPhase(ctx, k8sClient, clusterName, namespace, controller.PhaseReady, 5*time.Minute)
+				Expect(err).To(BeNil())
+			})
+
+			It("publishes shard services, labels, and cluster status", func() {
+				var dfObj resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      clusterName,
+					Namespace: namespace,
+				}, &dfObj)
+				Expect(err).To(BeNil())
+				Expect(dfObj.Status.Cluster).ToNot(BeNil())
+				Expect(dfObj.Status.Cluster.ConfigHash).ToNot(BeEmpty())
+
+				for _, shard := range clusterSpec.Spec.Cluster.Shards {
+					headlessName := fmt.Sprintf("%s-%s-headless", clusterName, shard.Name)
+					var svc corev1.Service
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      headlessName,
+						Namespace: namespace,
+					}, &svc)
+					Expect(err).To(BeNil())
+					Expect(svc.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
+					Expect(svc.Spec.PublishNotReadyAddresses).To(BeTrue())
+					Expect(svc.Spec.Selector[resources.ShardNameLabelKey]).To(Equal(shard.Name))
+				}
+
+				var clusterSvc corev1.Service
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      clusterName,
+					Namespace: namespace,
+				}, &clusterSvc)
+				Expect(err).To(BeNil())
+				Expect(clusterSvc.Spec.Selector[resources.DragonflyNameLabelKey]).To(Equal(clusterName))
+				Expect(clusterSvc.Spec.Selector).ToNot(HaveKey(resources.RoleLabelKey), "cluster service should not select role label in multi-shard mode")
+
+				var pods corev1.PodList
+				err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: clusterName,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).To(HaveLen(len(clusterSpec.Spec.Cluster.Shards)))
+
+				for _, pod := range pods.Items {
+					Expect(pod.Labels[resources.ShardNameLabelKey]).NotTo(BeEmpty(), "pod should carry shard label")
+					Expect(pod.Labels[resources.RoleLabelKey]).NotTo(BeEmpty(), "pod should carry role label")
+				}
+			})
+
+			AfterAll(func() {
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      clusterName,
+					Namespace: namespace,
+				}, &df)
+				if apierrors.IsNotFound(err) {
+					return
+				}
+				Expect(err).To(BeNil())
+				err = k8sClient.Delete(ctx, &df)
+				Expect(err).To(BeNil())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      clusterName,
+						Namespace: namespace,
+					}, &df)
+					return apierrors.IsNotFound(err)
+				}, 1*time.Minute, 2*time.Second).Should(BeTrue())
+			})
+		})
+
 		AfterAll(func() {
 			// Clean up resources created during the test
 			var df resourcesv1.Dragonfly

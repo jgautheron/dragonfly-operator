@@ -68,6 +68,11 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(fmt.Errorf("failed to get dragonfly instance: %w", err))
 	}
 
+	if dfi.isClusterMode() {
+		// Cluster mode orchestration is handled by the main reconciler.
+		return ctrl.Result{}, nil
+	}
+
 	podReady, readinessErr := dfi.isPodReady(ctx, &pod)
 	if readinessErr != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to verify pod readiness: %w", readinessErr)

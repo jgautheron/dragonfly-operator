@@ -18,6 +18,9 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"reflect"
@@ -119,7 +122,7 @@ func (dfi *DragonflyInstance) configureReplica(ctx context.Context, pod *corev1.
 // checkReplicaRole returns true if the given pod is a replica and is connected to the correct master.
 func (dfi *DragonflyInstance) checkReplicaRole(ctx context.Context, pod *corev1.Pod, masterIp string) (bool, error) {
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
 	})
 	defer redisClient.Close()
 
@@ -157,7 +160,7 @@ func (dfi *DragonflyInstance) checkReplicaRole(ctx context.Context, pod *corev1.
 // isReplicaStable returns true if the given replica is stable.
 func (dfi *DragonflyInstance) isReplicaStable(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
 	})
 	defer redisClient.Close()
 
@@ -384,6 +387,17 @@ func (dfi *DragonflyInstance) patchStatus(ctx context.Context, status dfv1alpha1
 	return nil
 }
 
+func (dfi *DragonflyInstance) adminPort() int32 {
+	if dfi.df.Spec.Cluster != nil && dfi.df.Spec.Cluster.AdminPort != 0 {
+		return dfi.df.Spec.Cluster.AdminPort
+	}
+	return resources.DragonflyAdminPort
+}
+
+func (dfi *DragonflyInstance) isClusterMode() bool {
+	return dfi.df.Spec.Cluster != nil && dfi.df.Spec.Cluster.Mode == dfv1alpha1.ClusterModeMultiShard
+}
+
 // isTerminating returns true if the dragonfly instance is being deleted
 func (dfi *DragonflyInstance) isTerminating() bool {
 	return dfi.df.ObjectMeta.DeletionTimestamp != nil
@@ -417,12 +431,12 @@ func (dfi *DragonflyInstance) detectOldMasters(ctx context.Context, updateRevisi
 // replicaOf configures the pod as a replica to the given master instance
 func (dfi *DragonflyInstance) replicaOf(ctx context.Context, pod *corev1.Pod, masterIp string) error {
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
 	})
 	defer redisClient.Close()
 
 	dfi.log.Info("trying to invoke SLAVE OF command", "pod", pod.Name, "master", masterIp, "addr", redisClient.Options().Addr)
-	resp, err := redisClient.SlaveOf(ctx, masterIp, fmt.Sprint(resources.DragonflyAdminPort)).Result()
+	resp, err := redisClient.SlaveOf(ctx, masterIp, fmt.Sprint(dfi.adminPort())).Result()
 	if err != nil {
 		return fmt.Errorf("error running SLAVE OF command: %s", err)
 	}
@@ -452,7 +466,7 @@ func (dfi *DragonflyInstance) replicaOf(ctx context.Context, pod *corev1.Pod, ma
 // replicaOfNoOne configures the pod as a master along while updating other pods to be replicas
 func (dfi *DragonflyInstance) replicaOfNoOne(ctx context.Context, pod *corev1.Pod) error {
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
 	})
 	defer redisClient.Close()
 
@@ -553,7 +567,7 @@ func (dfi *DragonflyInstance) reconcileResources(ctx context.Context) error {
 		}
 		dfi.log.Info("updated resource", "resource", desired.GetName())
 	}
-	if dfi.df.Spec.Replicas < 2 {
+	if dfi.df.Spec.Cluster == nil && dfi.df.Spec.Replicas < 2 {
 		if err = dfi.client.Delete(ctx, &policyv1.PodDisruptionBudget{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      dfi.df.Name,
@@ -615,7 +629,7 @@ func (dfi *DragonflyInstance) isDatasetLoaded(ctx context.Context, pod *corev1.P
 	}
 
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
 	})
 	defer redisClient.Close()
 
@@ -825,7 +839,7 @@ func (dfi *DragonflyInstance) replTakeover(ctx context.Context, newMaster *corev
 	dfi.log.Info("running REPLTAKEOVER on replica", "pod", newMaster.Name)
 
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: net.JoinHostPort(newMaster.Status.PodIP, strconv.Itoa(resources.DragonflyAdminPort)),
+		Addr: net.JoinHostPort(newMaster.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
 	})
 	defer redisClient.Close()
 
@@ -854,4 +868,228 @@ func (dfi *DragonflyInstance) replTakeover(ctx context.Context, newMaster *corev
 	}
 
 	return nil
+}
+
+func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result, error) {
+	dfi.log.Info("reconciling multi-shard cluster")
+
+	pods, err := dfi.getPods(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	shardPods := make(map[string][]*corev1.Pod)
+	allPods := make([]*corev1.Pod, 0, len(pods.Items))
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		allPods = append(allPods, pod)
+		shardName, ok := pod.Labels[resources.ShardNameLabelKey]
+		if !ok {
+			dfi.log.Info("pod missing shard label, waiting for sync", "pod", pod.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		shardPods[shardName] = append(shardPods[shardName], pod)
+	}
+
+	for _, shard := range dfi.df.Spec.Cluster.Shards {
+		if int32(len(shardPods[shard.Name])) != shard.Replicas {
+			dfi.log.Info("shard has unexpected replica count, waiting", "shard", shard.Name, "expected", shard.Replicas, "actual", len(shardPods[shard.Name]))
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	for _, pod := range allPods {
+		ready, err := dfi.isPodReady(ctx, pod)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to determine readiness: %w", err)
+		}
+		if !ready {
+			dfi.log.Info("pod not ready yet", "pod", pod.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if pod.Status.PodIP == "" {
+			dfi.log.Info("pod missing IP, waiting", "pod", pod.Name)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	masters := make(map[string]*corev1.Pod)
+	for _, shard := range dfi.df.Spec.Cluster.Shards {
+		master, err := dfi.ensureShardReplication(ctx, shard.Name, shardPods[shard.Name])
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		masters[shard.Name] = master
+	}
+
+	configJSON, hash, err := dfi.buildClusterConfig(ctx, masters, shardPods)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	status := dfi.getStatus()
+	if status.Cluster != nil && status.Cluster.ConfigHash == hash && status.Cluster.ObservedGeneration == dfi.df.Generation {
+		if status.Phase != PhaseReady {
+			status.Phase = PhaseReady
+			if err := dfi.patchStatus(ctx, status); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	status.Phase = PhaseConfiguring
+	if err := dfi.patchStatus(ctx, status); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+	}
+
+	if err := dfi.applyClusterConfig(ctx, configJSON, allPods); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	status.Cluster = &dfv1alpha1.ClusterStatus{
+		ConfigHash:         hash,
+		ObservedGeneration: dfi.df.Generation,
+	}
+	status.Phase = PhaseReady
+	if err := dfi.patchStatus(ctx, status); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
+	}
+
+	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "ClusterConfigured", "Applied Dragonfly cluster configuration")
+	return ctrl.Result{}, nil
+}
+
+func (dfi *DragonflyInstance) ensureShardReplication(ctx context.Context, shardName string, pods []*corev1.Pod) (*corev1.Pod, error) {
+	if len(pods) == 0 {
+		return nil, fmt.Errorf("no pods found for shard %s", shardName)
+	}
+
+	master := selectMasterPod(pods)
+	if master == nil {
+		master = pods[0]
+	}
+
+	if master.Status.PodIP == "" {
+		return nil, fmt.Errorf("master pod %s has no IP yet", master.Name)
+	}
+
+	if err := dfi.replicaOfNoOne(ctx, master); err != nil {
+		return nil, fmt.Errorf("failed to promote master in shard %s: %w", shardName, err)
+	}
+
+	for _, pod := range pods {
+		if pod.Name == master.Name {
+			continue
+		}
+		if err := dfi.configureReplica(ctx, pod, master.Status.PodIP); err != nil {
+			return nil, fmt.Errorf("failed to configure replica %s in shard %s: %w", pod.Name, shardName, err)
+		}
+	}
+
+	return master, nil
+}
+
+func selectMasterPod(pods []*corev1.Pod) *corev1.Pod {
+	for _, pod := range pods {
+		if role, ok := pod.Labels[resources.RoleLabelKey]; ok && role == resources.Master {
+			return pod
+		}
+	}
+	return nil
+}
+
+type clusterNodeAddress struct {
+	SlotRanges []dfv1alpha1.SlotRange `json:"slot_ranges"`
+	Master     *clusterNode           `json:"master"`
+	Replicas   []clusterNode          `json:"replicas"`
+}
+
+type clusterNode struct {
+	ID   string `json:"id"`
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+}
+
+type clusterConfig struct {
+	Ver   int                  `json:"ver"`
+	Nodes []clusterNodeAddress `json:"nodes"`
+}
+
+func (dfi *DragonflyInstance) buildClusterConfig(ctx context.Context, masters map[string]*corev1.Pod, shardPods map[string][]*corev1.Pod) (string, string, error) {
+	var nodes []clusterNodeAddress
+
+	for _, shard := range dfi.df.Spec.Cluster.Shards {
+		master := masters[shard.Name]
+		if master == nil {
+			return "", "", fmt.Errorf("shard %s has no master", shard.Name)
+		}
+
+		masterNode, err := dfi.getClusterNodeInfo(ctx, master)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to fetch master id for shard %s: %w", shard.Name, err)
+		}
+
+		replicas := []clusterNode{}
+		for _, pod := range shardPods[shard.Name] {
+			if pod.Name == master.Name {
+				continue
+			}
+
+			node, err := dfi.getClusterNodeInfo(ctx, pod)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to fetch replica id for shard %s: %w", shard.Name, err)
+			}
+			replicas = append(replicas, node)
+		}
+
+		nodes = append(nodes, clusterNodeAddress{
+			SlotRanges: shard.SlotRanges,
+			Master:     &masterNode,
+			Replicas:   replicas,
+		})
+	}
+
+	payload, err := json.Marshal(nodes)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to marshal cluster config: %w", err)
+	}
+
+	hash := sha256.Sum256(payload)
+	dfi.log.Info("generated cluster config", "config", string(payload))
+	return string(payload), hex.EncodeToString(hash[:]), nil
+}
+
+func (dfi *DragonflyInstance) applyClusterConfig(ctx context.Context, config string, pods []*corev1.Pod) error {
+	for _, pod := range pods {
+		redisClient := redis.NewClient(&redis.Options{
+			Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
+		})
+
+		if _, err := redisClient.Do(ctx, "DFLYCLUSTER", "CONFIG", config).Result(); err != nil {
+			redisClient.Close()
+			return fmt.Errorf("failed to apply cluster config on pod %s: %w", pod.Name, err)
+		}
+		redisClient.Close()
+	}
+
+	return nil
+}
+
+func (dfi *DragonflyInstance) getClusterNodeInfo(ctx context.Context, pod *corev1.Pod) (clusterNode, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr: net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
+	})
+	defer client.Close()
+
+	id, err := client.Do(ctx, "CLUSTER", "MYID").Text()
+	if err != nil {
+		return clusterNode{}, err
+	}
+
+	return clusterNode{
+		ID:   id,
+		IP:   pod.Status.PodIP,
+		Port: resources.DragonflyPort,
+	}, nil
 }

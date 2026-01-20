@@ -93,6 +93,10 @@ const (
 	Master = "master"
 
 	Replica = "replica"
+
+	ShardNameLabelKey = "dragonflydb.io/shard"
+
+	ClusterModeArg = "--cluster_mode"
 )
 
 var DefaultDragonflyArgs = []string{

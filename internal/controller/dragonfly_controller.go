@@ -69,6 +69,10 @@ func (r *DragonflyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, fmt.Errorf("failed to reconcile dragonfly resources: %w", err)
 	}
 
+	if dfi.isClusterMode() {
+		return dfi.reconcileCluster(ctx)
+	}
+
 	dfiStatus := dfi.getStatus()
 
 	if dfiStatus.Phase == PhaseReady || dfiStatus.Phase == PhaseReadyOld {

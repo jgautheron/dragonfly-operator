@@ -3,8 +3,11 @@ package resources
 import (
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	resourcesv1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -66,4 +69,48 @@ func TestMergeNamedSlices_EmptyBase(t *testing.T) {
 
 	assert.Len(t, result, 1)
 	assert.Equal(t, "user", result[0].Name)
+}
+
+func TestGenerateClusterResources(t *testing.T) {
+	df := &resourcesv1.Dragonfly{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "dragonflydb.io/v1alpha1", Kind: "Dragonfly"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "123"},
+		Spec: resourcesv1.DragonflySpec{
+			Cluster: &resourcesv1.ClusterSpec{
+				Mode: resourcesv1.ClusterModeMultiShard,
+				Shards: []resourcesv1.ClusterShardSpec{
+					{
+						Name:     "shard-a",
+						Replicas: 1,
+						SlotRanges: []resourcesv1.SlotRange{
+							{Start: 0, End: 8192},
+						},
+					},
+					{
+						Name:     "shard-b",
+						Replicas: 1,
+						SlotRanges: []resourcesv1.SlotRange{
+							{Start: 8192, End: 16384},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	objs, err := GenerateDragonflyResources(df)
+	assert.NoError(t, err)
+
+	var stsCount, serviceCount int
+	for _, obj := range objs {
+		switch obj.(type) {
+		case *appsv1.StatefulSet:
+			stsCount++
+		case *corev1.Service:
+			serviceCount++
+		}
+	}
+
+	assert.Equal(t, 2, stsCount, "expected one statefulset per shard")
+	assert.Equal(t, 3, serviceCount, "expected headless service per shard plus cluster service")
 }
