@@ -22,13 +22,18 @@ import (
 	"time"
 
 	dfv1alpha1 "github.com/dragonflydb/dragonfly-operator/api/v1alpha1"
+	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // DragonflyReconciler reconciles a Dragonfly object
@@ -155,6 +160,90 @@ func (r *DragonflyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&dfv1alpha1.Dragonfly{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.StatefulSet{}, builder.MatchEveryOwner).
 		Owns(&corev1.Service{}, builder.MatchEveryOwner).
+		// Watch pods for cluster mode resources to handle failover/split-brain
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.mapPodToDragonfly),
+			builder.WithPredicates(clusterModePodPredicate()),
+		).
 		Named("Dragonfly").
 		Complete(r)
+}
+
+// mapPodToDragonfly maps a pod to its parent Dragonfly CR for reconciliation.
+func (r *DragonflyReconciler) mapPodToDragonfly(ctx context.Context, obj client.Object) []reconcile.Request {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil
+	}
+
+	// Only process pods that belong to a Dragonfly cluster
+	dfName, ok := pod.Labels[resources.DragonflyNameLabelKey]
+	if !ok {
+		return nil
+	}
+
+	// Only process cluster mode pods (those with shard label)
+	if _, ok := pod.Labels[resources.ShardNameLabelKey]; !ok {
+		return nil
+	}
+
+	return []reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      dfName,
+				Namespace: pod.Namespace,
+			},
+		},
+	}
+}
+
+// clusterModePodPredicate filters pod events to only those relevant to cluster mode.
+func clusterModePodPredicate() predicate.Predicate {
+	isClusterPod := func(obj client.Object) bool {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok {
+			return false
+		}
+		// Only process cluster mode pods (those with shard label)
+		_, hasShard := pod.Labels[resources.ShardNameLabelKey]
+		_, hasDragonfly := pod.Labels[resources.DragonflyNameLabelKey]
+		return hasShard && hasDragonfly
+	}
+
+	hasRoleOrClusterLabelChange := func(oldPod, newPod *corev1.Pod) bool {
+		if oldPod == nil || newPod == nil {
+			return false
+		}
+		if oldPod.Labels[resources.RoleLabelKey] != newPod.Labels[resources.RoleLabelKey] {
+			return true
+		}
+		if oldPod.Labels[resources.ShardNameLabelKey] != newPod.Labels[resources.ShardNameLabelKey] {
+			return true
+		}
+		if oldPod.Labels[resources.DragonflyNameLabelKey] != newPod.Labels[resources.DragonflyNameLabelKey] {
+			return true
+		}
+		return false
+	}
+
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return isClusterPod(e.Object)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPod, _ := e.ObjectOld.(*corev1.Pod)
+			newPod, _ := e.ObjectNew.(*corev1.Pod)
+			if !isClusterPod(e.ObjectNew) {
+				return false
+			}
+			return hasRoleOrClusterLabelChange(oldPod, newPod)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return isClusterPod(e.Object)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return false
+		},
+	}
 }

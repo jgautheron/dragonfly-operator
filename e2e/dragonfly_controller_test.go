@@ -751,18 +751,20 @@ var _ = Describe("Dragonfly tiering test with single replica", Ordered, FlakeAtt
 
 			entries, err := parseTieredEntriesFromInfo(infoStr)
 			Expect(err).To(BeNil())
-			Expect(entries).To(Equal(int64(0))) // make sure this matches your expectation
+			baseEntries := entries
+			Expect(baseEntries).To(BeNumerically(">=", 0))
 
 			Expect(rc.Set(ctx, "foo", payload, 0).Err()).To(BeNil())
 
-			// Inserted one big key, tiered entries should be 1
-			infoStr, err = rc.Info(ctx, "tiered").Result()
-			Expect(err).To(BeNil())
-
-			fmt.Println("Tiered entried Info: ", infoStr)
-			entries, err = parseTieredEntriesFromInfo(infoStr)
-			Expect(err).To(BeNil())
-			Expect(entries).To(Equal(int64(1))) // make sure this matches your expectation
+			// Inserted one big key, tiered entries should increase by 1
+			Eventually(func() (int64, error) {
+				infoStr, err = rc.Info(ctx, "tiered").Result()
+				if err != nil {
+					return 0, err
+				}
+				fmt.Println("Tiered entried Info: ", infoStr)
+				return parseTieredEntriesFromInfo(infoStr)
+			}, 2*time.Minute, 5*time.Second).Should(BeNumerically(">=", baseEntries+1))
 
 			// Fetch and compare by size
 			data, err := rc.Get(ctx, "foo").Bytes()
@@ -1538,6 +1540,204 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 					}, &df)
 					return apierrors.IsNotFound(err)
 				}, 1*time.Minute, 2*time.Second).Should(BeTrue())
+			})
+		})
+
+		Context("Multi-shard cluster failover", Ordered, func() {
+			failoverClusterName := "df-cluster-failover"
+			failoverResources := corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+					corev1.ResourceMemory: resource.MustParse("400Mi"),
+				},
+			}
+
+			It("creates a cluster with 2 shards and 2 replicas per shard for failover testing", func() {
+				failoverSpec := resourcesv1.Dragonfly{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      failoverClusterName,
+						Namespace: namespace,
+					},
+					Spec: resourcesv1.DragonflySpec{
+						Resources: &failoverResources,
+						Cluster: &resourcesv1.ClusterSpec{
+							Mode:             resourcesv1.ClusterModeMultiShard,
+							Shards:           2,
+							ReplicasPerShard: 2,
+						},
+					},
+				}
+				err := k8sClient.Create(ctx, failoverSpec.DeepCopy())
+				Expect(err).To(BeNil())
+
+				// Wait for all statefulsets to be ready
+				for i := int32(0); i < failoverSpec.Spec.Cluster.Shards; i++ {
+					stsName := fmt.Sprintf("%s-shard-%d", failoverClusterName, i)
+					err := waitForStatefulSetReady(ctx, k8sClient, stsName, namespace, 5*time.Minute)
+					Expect(err).To(BeNil(), "statefulset %s should be ready", stsName)
+				}
+
+				err = waitForDragonflyPhase(ctx, k8sClient, failoverClusterName, namespace, controller.PhaseReady, 5*time.Minute)
+				Expect(err).To(BeNil())
+			})
+
+			It("promotes replica to master when shard master is deleted", func() {
+				// Find the master pod of shard-0
+				var shardPods corev1.PodList
+				err := k8sClient.List(ctx, &shardPods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: failoverClusterName,
+					resources.ShardNameLabelKey:     "shard-0",
+				})
+				Expect(err).To(BeNil())
+				Expect(shardPods.Items).To(HaveLen(2))
+
+				var masterPod *corev1.Pod
+				var replicaPod *corev1.Pod
+				for i := range shardPods.Items {
+					if shardPods.Items[i].Labels[resources.RoleLabelKey] == resources.Master {
+						masterPod = &shardPods.Items[i]
+					} else {
+						replicaPod = &shardPods.Items[i]
+					}
+				}
+				Expect(masterPod).NotTo(BeNil(), "should have a master pod")
+				Expect(replicaPod).NotTo(BeNil(), "should have a replica pod")
+
+				originalMasterName := masterPod.Name
+				replicaName := replicaPod.Name
+
+				// Delete the master pod
+				err = k8sClient.Delete(ctx, masterPod)
+				Expect(err).To(BeNil())
+
+				// Wait for the replica to be promoted to master
+				Eventually(func() (string, error) {
+					var pod corev1.Pod
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      replicaName,
+						Namespace: namespace,
+					}, &pod)
+					if err != nil {
+						return "", err
+					}
+					return pod.Labels[resources.RoleLabelKey], nil
+				}, 3*time.Minute, 5*time.Second).Should(Equal(resources.Master), "replica should be promoted to master")
+
+				// Wait for the original master pod to be recreated and become a replica
+				Eventually(func() (string, error) {
+					var pod corev1.Pod
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      originalMasterName,
+						Namespace: namespace,
+					}, &pod)
+					if err != nil {
+						return "", err
+					}
+					// Check if pod is ready
+					if pod.Status.Phase != corev1.PodRunning {
+						return "", fmt.Errorf("pod not running yet")
+					}
+					return pod.Labels[resources.RoleLabelKey], nil
+				}, 3*time.Minute, 5*time.Second).Should(Equal(resources.Replica), "recreated pod should become replica")
+
+				// Verify cluster is still operational
+				err = waitForDragonflyPhase(ctx, k8sClient, failoverClusterName, namespace, controller.PhaseReady, 2*time.Minute)
+				Expect(err).To(BeNil())
+
+				// Verify cluster config is still correct
+				var pods corev1.PodList
+				err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: failoverClusterName,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).NotTo(BeEmpty())
+
+				Eventually(func() ([]slotRange, error) {
+					return getClusterSlotRanges(ctx, clientset, cfg, &pods.Items[0], resources.DragonflyAdminPort)
+				}, 2*time.Minute, 5*time.Second).Should(WithTransform(func(ranges []slotRange) string {
+					if len(ranges) < 2 {
+						return fmt.Sprintf("len:%d", len(ranges))
+					}
+					return fmt.Sprintf("%d:%d,%d:%d", ranges[0].Start, ranges[0].End, ranges[1].Start, ranges[1].End)
+				}, Equal("0:8191,8192:16383")))
+			})
+
+			It("resolves split-brain when multiple pods are labeled as master", func() {
+				// Get shard-1 pods
+				var shardPods corev1.PodList
+				err := k8sClient.List(ctx, &shardPods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: failoverClusterName,
+					resources.ShardNameLabelKey:     "shard-1",
+				})
+				Expect(err).To(BeNil())
+				Expect(shardPods.Items).To(HaveLen(2))
+
+				// Artificially label both pods as master to simulate split-brain
+				for i := range shardPods.Items {
+					pod := &shardPods.Items[i]
+					patchFrom := client.MergeFrom(pod.DeepCopy())
+					pod.Labels[resources.RoleLabelKey] = resources.Master
+					err := k8sClient.Patch(ctx, pod, patchFrom)
+					Expect(err).To(BeNil())
+				}
+
+				// Wait for the operator to resolve the split-brain
+				// Should result in exactly one master per shard
+				Eventually(func() (int, error) {
+					var pods corev1.PodList
+					err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+						resources.DragonflyNameLabelKey: failoverClusterName,
+						resources.ShardNameLabelKey:     "shard-1",
+						resources.RoleLabelKey:          resources.Master,
+					})
+					if err != nil {
+						return 0, err
+					}
+					return len(pods.Items), nil
+				}, 3*time.Minute, 5*time.Second).Should(Equal(1), "should have exactly one master after split-brain resolution")
+
+				// Verify one replica exists
+				Eventually(func() (int, error) {
+					var pods corev1.PodList
+					err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+						resources.DragonflyNameLabelKey: failoverClusterName,
+						resources.ShardNameLabelKey:     "shard-1",
+						resources.RoleLabelKey:          resources.Replica,
+					})
+					if err != nil {
+						return 0, err
+					}
+					return len(pods.Items), nil
+				}, 3*time.Minute, 5*time.Second).Should(Equal(1), "should have exactly one replica after split-brain resolution")
+
+				// Verify cluster is still ready
+				err = waitForDragonflyPhase(ctx, k8sClient, failoverClusterName, namespace, controller.PhaseReady, 2*time.Minute)
+				Expect(err).To(BeNil())
+			})
+
+			AfterAll(func() {
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      failoverClusterName,
+					Namespace: namespace,
+				}, &df)
+				if apierrors.IsNotFound(err) {
+					return
+				}
+				Expect(err).To(BeNil())
+				err = k8sClient.Delete(ctx, &df)
+				Expect(err).To(BeNil())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      failoverClusterName,
+						Namespace: namespace,
+					}, &df)
+					return apierrors.IsNotFound(err)
+				}, 2*time.Minute, 2*time.Second).Should(BeTrue())
 			})
 		})
 

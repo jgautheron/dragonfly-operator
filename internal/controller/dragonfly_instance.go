@@ -1025,47 +1025,103 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 		replicasPerShard = 1
 	}
 
+	// Check if we need to handle failover (some pods are missing, unhealthy, or split-brain)
+	needsFailover := false
 	for i := int32(0); i < dfi.df.Spec.Cluster.Shards; i++ {
 		shardName := fmt.Sprintf("shard-%d", i)
-		if int32(len(shardPods[shardName])) != replicasPerShard {
-			dfi.log.Info("shard has unexpected replica count, waiting", "shard", shardName, "expected", replicasPerShard, "actual", len(shardPods[shardName]))
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		pods := shardPods[shardName]
+
+		// Check for split-brain (multiple masters)
+		masters := selectMasterPods(pods)
+		if len(masters) > 1 {
+			dfi.log.Info("shard has split-brain, needs resolution", "shard", shardName, "masterCount", len(masters))
+			needsFailover = true
+			continue
+		}
+
+		// Check if master is missing or unhealthy
+		currentMaster := selectMasterPod(pods)
+		if currentMaster == nil || !dfi.isShardMasterHealthy(ctx, currentMaster) {
+			// Check if we have at least one ready pod that could become master
+			hasReadyCandidate := false
+			for _, pod := range pods {
+				if pod.Status.PodIP != "" && isRunningAndReady(pod) && !isTerminating(pod) {
+					hasReadyCandidate = true
+					break
+				}
+			}
+			if hasReadyCandidate {
+				dfi.log.Info("shard needs failover", "shard", shardName, "hasMaster", currentMaster != nil)
+				needsFailover = true
+			}
 		}
 	}
 
-	for _, pod := range allPods {
-		ready, err := dfi.isPodReady(ctx, pod)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to determine readiness: %w", err)
+	// If no failover needed, wait for all pods to be ready before proceeding
+	if !needsFailover {
+		for i := int32(0); i < dfi.df.Spec.Cluster.Shards; i++ {
+			shardName := fmt.Sprintf("shard-%d", i)
+			if int32(len(shardPods[shardName])) != replicasPerShard {
+				dfi.log.Info("shard has unexpected replica count, waiting", "shard", shardName, "expected", replicasPerShard, "actual", len(shardPods[shardName]))
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
 		}
-		if !ready {
-			dfi.log.Info("pod not ready yet", "pod", pod.Name)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		if pod.Status.PodIP == "" {
-			dfi.log.Info("pod missing IP, waiting", "pod", pod.Name)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+		for _, pod := range allPods {
+			ready, err := dfi.isPodReady(ctx, pod)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to determine readiness: %w", err)
+			}
+			if !ready {
+				dfi.log.Info("pod not ready yet", "pod", pod.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			if pod.Status.PodIP == "" {
+				dfi.log.Info("pod missing IP, waiting", "pod", pod.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
 		}
 	}
 
+	// Build map of ready pods per shard and ensure each shard has a working master
 	masters := make(map[string]*corev1.Pod)
+	readyShardPods := make(map[string][]*corev1.Pod)
+	var readyAllPods []*corev1.Pod
+
 	for i := int32(0); i < dfi.df.Spec.Cluster.Shards; i++ {
 		shardName := fmt.Sprintf("shard-%d", i)
-		master, err := dfi.ensureShardReplication(ctx, shardName, shardPods[shardName])
+		pods := shardPods[shardName]
+
+		// Filter to only ready pods with IPs
+		var readyPods []*corev1.Pod
+		for _, pod := range pods {
+			if pod.Status.PodIP != "" && isRunningAndReady(pod) && !isTerminating(pod) {
+				readyPods = append(readyPods, pod)
+				readyAllPods = append(readyAllPods, pod)
+			}
+		}
+		readyShardPods[shardName] = readyPods
+
+		if len(readyPods) == 0 {
+			dfi.log.Info("no ready pods in shard, waiting", "shard", shardName)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		master, err := dfi.ensureShardReplication(ctx, shardName, readyPods)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		masters[shardName] = master
 	}
 
-	configJSON, hash, err := dfi.buildClusterConfig(ctx, masters, shardPods)
+	configJSON, hash, err := dfi.buildClusterConfig(ctx, masters, readyShardPods)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	status := dfi.getStatus()
 	if status.Cluster != nil && status.Cluster.ConfigHash == hash && status.Cluster.ObservedGeneration == dfi.df.Generation {
-		allConfigured, err := dfi.allNodesConfigured(ctx, allPods)
+		allConfigured, err := dfi.allNodesConfigured(ctx, readyAllPods)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1086,7 +1142,7 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 		return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 	}
 
-	if err := dfi.applyClusterConfig(ctx, configJSON, allPods); err != nil {
+	if err := dfi.applyClusterConfig(ctx, configJSON, readyAllPods); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1108,29 +1164,224 @@ func (dfi *DragonflyInstance) ensureShardReplication(ctx context.Context, shardN
 		return nil, fmt.Errorf("no pods found for shard %s", shardName)
 	}
 
-	master := selectMasterPod(pods)
-	if master == nil {
-		master = pods[0]
+	// Detect split-brain: multiple pods labeled as master
+	masters := selectMasterPods(pods)
+	if len(masters) > 1 {
+		dfi.log.Info("split-brain detected: multiple masters in shard", "shard", shardName, "masterCount", len(masters))
+		// Resolve by picking the first master deterministically (pods are sorted by name)
+		// and demoting the rest
+		master, err := dfi.resolveSplitBrain(ctx, shardName, masters, pods)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve split-brain in shard %s: %w", shardName, err)
+		}
+		return master, nil
 	}
 
-	if master.Status.PodIP == "" {
-		return nil, fmt.Errorf("master pod %s has no IP yet", master.Name)
+	// Find current master (if any)
+	currentMaster := selectMasterPod(pods)
+
+	// Check if current master is healthy
+	if currentMaster != nil && dfi.isShardMasterHealthy(ctx, currentMaster) {
+		dfi.log.Info("shard master is healthy", "shard", shardName, "master", currentMaster.Name)
+		// Ensure all replicas are configured correctly
+		for _, pod := range pods {
+			if pod.Name == currentMaster.Name {
+				continue
+			}
+			if err := dfi.configureReplica(ctx, pod, currentMaster.Status.PodIP); err != nil {
+				return nil, fmt.Errorf("failed to configure replica %s in shard %s: %w", pod.Name, shardName, err)
+			}
+		}
+		return currentMaster, nil
 	}
 
-	if err := dfi.replicaOfNoOne(ctx, master); err != nil {
+	// Master is unhealthy or doesn't exist - need to promote a new one
+	if currentMaster != nil {
+		dfi.log.Info("shard master is unhealthy, initiating failover", "shard", shardName, "master", currentMaster.Name)
+		dfi.eventRecorder.Event(dfi.df, corev1.EventTypeWarning, "MasterUnhealthy", fmt.Sprintf("Shard %s master %s is unhealthy, initiating failover", shardName, currentMaster.Name))
+	} else {
+		dfi.log.Info("no master found for shard, selecting new master", "shard", shardName)
+	}
+
+	// Select best replica candidate for promotion
+	newMaster := dfi.selectBestReplicaCandidate(ctx, pods, currentMaster)
+	if newMaster == nil {
+		// No stable replica found - fall back to first ready pod
+		for _, pod := range pods {
+			if currentMaster != nil && pod.Name == currentMaster.Name {
+				continue
+			}
+			ready, err := dfi.isPodReady(ctx, pod)
+			if err == nil && ready && pod.Status.PodIP != "" {
+				newMaster = pod
+				dfi.log.Info("no stable replica found, falling back to first ready pod", "shard", shardName, "pod", pod.Name)
+				break
+			}
+		}
+	}
+
+	if newMaster == nil {
+		// If still no candidate, try the current master if it has an IP (might just be temporarily unreachable)
+		if currentMaster != nil && currentMaster.Status.PodIP != "" {
+			newMaster = currentMaster
+			dfi.log.Info("no healthy replica available, keeping current master", "shard", shardName, "master", currentMaster.Name)
+		} else if len(pods) > 0 && pods[0].Status.PodIP != "" {
+			// Last resort: use first pod
+			newMaster = pods[0]
+			dfi.log.Info("no healthy candidate, using first pod as master", "shard", shardName, "pod", pods[0].Name)
+		} else {
+			return nil, fmt.Errorf("no suitable master candidate found for shard %s", shardName)
+		}
+	}
+
+	// Attempt graceful promotion if old master is reachable
+	if currentMaster != nil && currentMaster.Name != newMaster.Name && dfi.isMasterReachable(ctx, currentMaster) {
+		dfi.log.Info("attempting graceful failover with REPLTAKEOVER", "shard", shardName, "oldMaster", currentMaster.Name, "newMaster", newMaster.Name)
+		err := dfi.replTakeoverForShard(ctx, newMaster, currentMaster)
+		if err != nil {
+			dfi.log.Info("REPLTAKEOVER failed, falling back to SLAVEOF NO ONE", "shard", shardName, "err", err)
+			// Fall through to force promotion
+		} else {
+			dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "MasterPromoted", fmt.Sprintf("Shard %s: promoted %s to master via REPLTAKEOVER", shardName, newMaster.Name))
+			// Configure remaining pods as replicas
+			for _, pod := range pods {
+				if pod.Name == newMaster.Name {
+					continue
+				}
+				// Skip the old master - it will be reconfigured when it comes back
+				if currentMaster != nil && pod.Name == currentMaster.Name {
+					continue
+				}
+				if err := dfi.configureReplica(ctx, pod, newMaster.Status.PodIP); err != nil {
+					return nil, fmt.Errorf("failed to configure replica %s in shard %s: %w", pod.Name, shardName, err)
+				}
+			}
+			return newMaster, nil
+		}
+	}
+
+	// Force promotion via SLAVEOF NO ONE
+	dfi.log.Info("promoting new master via SLAVEOF NO ONE", "shard", shardName, "newMaster", newMaster.Name)
+	if err := dfi.replicaOfNoOne(ctx, newMaster); err != nil {
 		return nil, fmt.Errorf("failed to promote master in shard %s: %w", shardName, err)
 	}
 
+	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "MasterPromoted", fmt.Sprintf("Shard %s: promoted %s to master", shardName, newMaster.Name))
+
+	// Configure all other pods as replicas
 	for _, pod := range pods {
-		if pod.Name == master.Name {
+		if pod.Name == newMaster.Name {
 			continue
 		}
-		if err := dfi.configureReplica(ctx, pod, master.Status.PodIP); err != nil {
+		if err := dfi.configureReplica(ctx, pod, newMaster.Status.PodIP); err != nil {
 			return nil, fmt.Errorf("failed to configure replica %s in shard %s: %w", pod.Name, shardName, err)
 		}
 	}
 
-	return master, nil
+	return newMaster, nil
+}
+
+// resolveSplitBrain handles the case where multiple pods are labeled as master.
+// It picks the first healthy master deterministically and demotes the rest.
+func (dfi *DragonflyInstance) resolveSplitBrain(ctx context.Context, shardName string, masters []*corev1.Pod, allPods []*corev1.Pod) (*corev1.Pod, error) {
+	// Sort masters by name for deterministic selection
+	sortPodsByName(masters)
+
+	// Find first healthy master
+	var electedMaster *corev1.Pod
+	for _, master := range masters {
+		if dfi.isShardMasterHealthy(ctx, master) {
+			electedMaster = master
+			break
+		}
+	}
+
+	// If no healthy master, pick the first one with an IP
+	if electedMaster == nil {
+		for _, master := range masters {
+			if master.Status.PodIP != "" {
+				electedMaster = master
+				break
+			}
+		}
+	}
+
+	if electedMaster == nil {
+		return nil, fmt.Errorf("no viable master found during split-brain resolution for shard %s", shardName)
+	}
+
+	dfi.log.Info("resolved split-brain, elected master", "shard", shardName, "electedMaster", electedMaster.Name)
+	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeWarning, "SplitBrainResolved", fmt.Sprintf("Shard %s: resolved split-brain, elected %s as master", shardName, electedMaster.Name))
+
+	// Ensure elected master is actually master
+	if err := dfi.replicaOfNoOne(ctx, electedMaster); err != nil {
+		return nil, fmt.Errorf("failed to confirm master in shard %s: %w", shardName, err)
+	}
+
+	// Demote all other pods to replicas
+	for _, pod := range allPods {
+		if pod.Name == electedMaster.Name {
+			continue
+		}
+		if err := dfi.configureReplica(ctx, pod, electedMaster.Status.PodIP); err != nil {
+			return nil, fmt.Errorf("failed to demote %s to replica in shard %s: %w", pod.Name, shardName, err)
+		}
+	}
+
+	return electedMaster, nil
+}
+
+// replTakeoverForShard performs a REPLTAKEOVER for shard failover.
+// Unlike the rolling update version, this doesn't delete the old master pod.
+func (dfi *DragonflyInstance) replTakeoverForShard(ctx context.Context, newMaster *corev1.Pod, oldMaster *corev1.Pod) error {
+	dfi.log.Info("running REPLTAKEOVER for shard failover", "newMaster", newMaster.Name, "oldMaster", oldMaster.Name)
+
+	redisClient := redis.NewClient(&redis.Options{
+		ClientName: resources.DragonflyOperatorName,
+		Addr:       net.JoinHostPort(newMaster.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	defer redisClient.Close()
+
+	resp, err := redisClient.Do(ctx, "repltakeover", "10000").Result()
+	if err != nil {
+		return fmt.Errorf("error running REPLTAKEOVER command: %w", err)
+	}
+
+	if resp != "OK" {
+		return fmt.Errorf("response of REPLTAKEOVER is not OK: %s", resp)
+	}
+
+	// Update labels on new master
+	masterIp := newMaster.Status.PodIP
+	patchFrom := client.MergeFrom(newMaster.DeepCopy())
+	newMaster.Labels[resources.RoleLabelKey] = resources.Master
+	delete(newMaster.Labels, resources.MasterIpLabelKey)
+	if newMaster.Annotations == nil {
+		newMaster.Annotations = make(map[string]string)
+	}
+	newMaster.Annotations[resources.MasterIpAnnotationKey] = masterIp
+
+	if err := dfi.client.Patch(ctx, newMaster, patchFrom); err != nil {
+		return fmt.Errorf("failed to update labels on new master: %w", err)
+	}
+
+	// Update labels on old master to replica
+	patchFromOld := client.MergeFrom(oldMaster.DeepCopy())
+	oldMaster.Labels[resources.RoleLabelKey] = resources.Replica
+	oldMaster.Labels[resources.MasterIpLabelKey] = masterIp
+	if oldMaster.Annotations == nil {
+		oldMaster.Annotations = make(map[string]string)
+	}
+	oldMaster.Annotations[resources.MasterIpAnnotationKey] = masterIp
+
+	if err := dfi.client.Patch(ctx, oldMaster, patchFromOld); err != nil {
+		dfi.log.Info("failed to update labels on old master, will be fixed on next reconcile", "pod", oldMaster.Name, "err", err)
+	}
+
+	return nil
 }
 
 func selectMasterPod(pods []*corev1.Pod) *corev1.Pod {
@@ -1142,10 +1393,135 @@ func selectMasterPod(pods []*corev1.Pod) *corev1.Pod {
 	return nil
 }
 
+// selectMasterPods returns all pods labeled as master in the given slice.
+// Used to detect split-brain scenarios.
+func selectMasterPods(pods []*corev1.Pod) []*corev1.Pod {
+	var masters []*corev1.Pod
+	for _, pod := range pods {
+		if role, ok := pod.Labels[resources.RoleLabelKey]; ok && role == resources.Master {
+			masters = append(masters, pod)
+		}
+	}
+	return masters
+}
+
 func sortPodsByName(pods []*corev1.Pod) {
 	sort.Slice(pods, func(i, j int) bool {
 		return pods[i].Name < pods[j].Name
 	})
+}
+
+// isShardMasterHealthy checks if the given master pod is healthy:
+// - Kubernetes ready
+// - Admin port reachable
+// - Actually has master role in Redis
+func (dfi *DragonflyInstance) isShardMasterHealthy(ctx context.Context, master *corev1.Pod) bool {
+	if master == nil || master.Status.PodIP == "" {
+		return false
+	}
+
+	// Check Kubernetes readiness
+	ready, err := dfi.isPodReady(ctx, master)
+	if err != nil || !ready {
+		dfi.log.Info("shard master not ready", "pod", master.Name, "err", err)
+		return false
+	}
+
+	// Check admin port reachability and Redis role
+	client := redis.NewClient(&redis.Options{
+		ClientName: resources.DragonflyOperatorName,
+		Addr:       net.JoinHostPort(master.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	defer client.Close()
+
+	// Ping to verify connectivity
+	if _, err := client.Ping(ctx).Result(); err != nil {
+		dfi.log.Info("shard master unreachable", "pod", master.Name, "err", err)
+		return false
+	}
+
+	// Verify Redis role is master
+	info, err := client.Info(ctx, "replication").Result()
+	if err != nil {
+		dfi.log.Info("failed to get replication info from master", "pod", master.Name, "err", err)
+		return false
+	}
+
+	replicationData := parseInfoToMap(info)
+	role, ok := replicationData["role"]
+	if !ok || role != "master" {
+		dfi.log.Info("shard master has incorrect Redis role", "pod", master.Name, "role", role)
+		return false
+	}
+
+	return true
+}
+
+// isMasterReachable checks if the master pod is reachable via admin port.
+func (dfi *DragonflyInstance) isMasterReachable(ctx context.Context, master *corev1.Pod) bool {
+	if master == nil || master.Status.PodIP == "" {
+		return false
+	}
+
+	client := redis.NewClient(&redis.Options{
+		ClientName: resources.DragonflyOperatorName,
+		Addr:       net.JoinHostPort(master.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	defer client.Close()
+
+	_, err := client.Ping(ctx).Result()
+	return err == nil
+}
+
+// selectBestReplicaCandidate selects the best replica for promotion from a list of pods.
+// Selection criteria:
+// 1. Must be Kubernetes ready
+// 2. Must have stable replication state (isReplicaStable)
+// 3. Deterministic ordering by pod name (first ready+stable wins)
+// Returns nil if no suitable candidate found.
+func (dfi *DragonflyInstance) selectBestReplicaCandidate(ctx context.Context, pods []*corev1.Pod, excludeMaster *corev1.Pod) *corev1.Pod {
+	// Pods should already be sorted by name for deterministic selection
+	for _, pod := range pods {
+		// Skip current master
+		if excludeMaster != nil && pod.Name == excludeMaster.Name {
+			continue
+		}
+
+		// Check Kubernetes readiness
+		ready, err := dfi.isPodReady(ctx, pod)
+		if err != nil || !ready {
+			dfi.log.Info("replica candidate not ready", "pod", pod.Name, "err", err)
+			continue
+		}
+
+		// Check if pod has IP
+		if pod.Status.PodIP == "" {
+			dfi.log.Info("replica candidate has no IP", "pod", pod.Name)
+			continue
+		}
+
+		// Check replication stability
+		stable, err := dfi.isReplicaStable(ctx, pod)
+		if err != nil {
+			dfi.log.Info("failed to check replica stability", "pod", pod.Name, "err", err)
+			continue
+		}
+		if !stable {
+			dfi.log.Info("replica candidate not stable", "pod", pod.Name)
+			continue
+		}
+
+		dfi.log.Info("selected replica candidate for promotion", "pod", pod.Name)
+		return pod
+	}
+
+	return nil
 }
 
 type clusterNodeAddress struct {
