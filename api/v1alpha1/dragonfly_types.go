@@ -334,6 +334,9 @@ type ClusterStatus struct {
 	ConfigHash string `json:"configHash,omitempty"`
 	// ObservedGeneration indicates which spec revision the status represents.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// LastConfigAppliedAt indicates when the cluster config was last applied.
+	// +optional
+	LastConfigAppliedAt *metav1.Time `json:"lastConfigAppliedAt,omitempty"`
 }
 
 //+kubebuilder:object:root=true

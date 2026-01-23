@@ -7087,6 +7087,11 @@ spec:
                     description: ConfigHash is the hash of the last applied DFLYCLUSTER
                       CONFIG payload.
                     type: string
+                  lastConfigAppliedAt:
+                    description: LastConfigAppliedAt indicates when the cluster config
+                      was last applied.
+                    format: date-time
+                    type: string
                   observedGeneration:
                     description: ObservedGeneration indicates which spec revision
                       the status represents.

@@ -1741,6 +1741,308 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 			})
 		})
 
+		Context("Hardened failover behavior", Ordered, func() {
+			hardenClusterName := "df-cluster-hardened"
+			hardenResources := corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+					corev1.ResourceMemory: resource.MustParse("400Mi"),
+				},
+			}
+
+			It("creates a cluster for hardened failover testing", func() {
+				hardenSpec := resourcesv1.Dragonfly{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      hardenClusterName,
+						Namespace: namespace,
+					},
+					Spec: resourcesv1.DragonflySpec{
+						Resources: &hardenResources,
+						Cluster: &resourcesv1.ClusterSpec{
+							Mode:             resourcesv1.ClusterModeMultiShard,
+							Shards:           2,
+							ReplicasPerShard: 2,
+						},
+					},
+				}
+				err := k8sClient.Create(ctx, hardenSpec.DeepCopy())
+				Expect(err).To(BeNil())
+
+				// Wait for all statefulsets to be ready
+				for i := int32(0); i < hardenSpec.Spec.Cluster.Shards; i++ {
+					stsName := fmt.Sprintf("%s-shard-%d", hardenClusterName, i)
+					err := waitForStatefulSetReady(ctx, k8sClient, stsName, namespace, 5*time.Minute)
+					Expect(err).To(BeNil(), "statefulset %s should be ready", stsName)
+				}
+
+				err = waitForDragonflyPhase(ctx, k8sClient, hardenClusterName, namespace, controller.PhaseReady, 5*time.Minute)
+				Expect(err).To(BeNil())
+			})
+
+			It("verifies masterSince annotation is set on master pods", func() {
+				// Get all pods for the cluster
+				var pods corev1.PodList
+				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: hardenClusterName,
+					resources.RoleLabelKey:          resources.Master,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).NotTo(BeEmpty(), "should have at least one master pod")
+
+				for _, pod := range pods.Items {
+					Expect(pod.Annotations).To(HaveKey(resources.MasterSinceAnnotationKey),
+						"master pod %s should have masterSince annotation", pod.Name)
+					// Verify the annotation is a valid RFC3339 timestamp
+					_, err := time.Parse(time.RFC3339, pod.Annotations[resources.MasterSinceAnnotationKey])
+					Expect(err).To(BeNil(), "masterSince annotation should be valid RFC3339 timestamp")
+				}
+			})
+
+			It("verifies config cooldown prevents rapid reapplication", func() {
+				// Get the Dragonfly resource and record the last config applied time
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      hardenClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+				Expect(df.Status.Cluster).NotTo(BeNil())
+				Expect(df.Status.Cluster.LastConfigAppliedAt).NotTo(BeNil())
+
+				lastApplied := df.Status.Cluster.LastConfigAppliedAt.Time
+				configHash := df.Status.Cluster.ConfigHash
+
+				// Force a reconcile by updating a label on one of the pods
+				// This should not reapply the config since it's within the 30s cooldown
+				var pods corev1.PodList
+				err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: hardenClusterName,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).NotTo(BeEmpty())
+
+				// Wait a bit less than the cooldown
+				time.Sleep(5 * time.Second)
+
+				// Check the status - the LastConfigAppliedAt should not have changed
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      hardenClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+				Expect(df.Status.Cluster.LastConfigAppliedAt.Time).To(Equal(lastApplied),
+					"LastConfigAppliedAt should not change during cooldown")
+				Expect(df.Status.Cluster.ConfigHash).To(Equal(configHash),
+					"ConfigHash should remain unchanged")
+			})
+
+			It("verifies failover and cluster recovery after master deletion", func() {
+				// Use shard-1 to avoid interference with other tests that use shard-0
+				// First ensure the cluster is in a stable state with proper role distribution
+				Eventually(func() (bool, error) {
+					var shardPods corev1.PodList
+					err := k8sClient.List(ctx, &shardPods, client.InNamespace(namespace), client.MatchingLabels{
+						resources.DragonflyNameLabelKey: hardenClusterName,
+						resources.ShardNameLabelKey:     "shard-1",
+					})
+					if err != nil {
+						return false, err
+					}
+					if len(shardPods.Items) != 2 {
+						return false, nil
+					}
+					masterCount := 0
+					replicaCount := 0
+					for _, pod := range shardPods.Items {
+						if pod.Labels[resources.RoleLabelKey] == resources.Master {
+							masterCount++
+						} else if pod.Labels[resources.RoleLabelKey] == resources.Replica {
+							replicaCount++
+						}
+					}
+					return masterCount == 1 && replicaCount == 1, nil
+				}, 2*time.Minute, 5*time.Second).Should(BeTrue(), "shard-1 should have exactly 1 master and 1 replica")
+
+				// Now find the master and replica pods
+				var shardPods corev1.PodList
+				err := k8sClient.List(ctx, &shardPods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: hardenClusterName,
+					resources.ShardNameLabelKey:     "shard-1",
+				})
+				Expect(err).To(BeNil())
+				Expect(shardPods.Items).To(HaveLen(2))
+
+				var masterPod *corev1.Pod
+				var replicaPod *corev1.Pod
+				for i := range shardPods.Items {
+					if shardPods.Items[i].Labels[resources.RoleLabelKey] == resources.Master {
+						masterPod = &shardPods.Items[i]
+					} else {
+						replicaPod = &shardPods.Items[i]
+					}
+				}
+				Expect(masterPod).NotTo(BeNil(), "should have a master pod")
+				Expect(replicaPod).NotTo(BeNil(), "should have a replica pod")
+
+				replicaName := replicaPod.Name
+				masterName := masterPod.Name
+
+				// Delete the master pod to trigger failover
+				err = k8sClient.Delete(ctx, masterPod)
+				Expect(err).To(BeNil())
+
+				// Wait for the master pod to be fully deleted and recreated by StatefulSet
+				Eventually(func() bool {
+					var pod corev1.Pod
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      masterName,
+						Namespace: namespace,
+					}, &pod)
+					if err != nil {
+						return false
+					}
+					// Pod should be recreated (new UID) and running
+					return pod.UID != masterPod.UID && pod.Status.Phase == corev1.PodRunning
+				}, 2*time.Minute, 5*time.Second).Should(BeTrue(), "master pod should be recreated")
+
+				// After pod deletion, the replica should eventually be promoted to master
+				Eventually(func() (string, error) {
+					var pod corev1.Pod
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      replicaName,
+						Namespace: namespace,
+					}, &pod)
+					if err != nil {
+						return "", err
+					}
+					return pod.Labels[resources.RoleLabelKey], nil
+				}, 2*time.Minute, 5*time.Second).Should(Equal(resources.Master),
+					"replica should be promoted to master after master deletion")
+
+				// Ensure cluster has exactly 1 master in shard-1
+				Eventually(func() (int, error) {
+					var pods corev1.PodList
+					err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+						resources.DragonflyNameLabelKey: hardenClusterName,
+						resources.ShardNameLabelKey:     "shard-1",
+					})
+					if err != nil {
+						return 0, err
+					}
+					masterCount := 0
+					for _, pod := range pods.Items {
+						if pod.Labels[resources.RoleLabelKey] == resources.Master {
+							masterCount++
+						}
+					}
+					return masterCount, nil
+				}, 2*time.Minute, 5*time.Second).Should(Equal(1),
+					"shard should have exactly 1 master after failover")
+
+				// Wait for cluster to stabilize
+				err = waitForDragonflyPhase(ctx, k8sClient, hardenClusterName, namespace, controller.PhaseReady, 2*time.Minute)
+				Expect(err).To(BeNil())
+			})
+
+			It("verifies cooldown blocks config reapply after label mutation", func() {
+				// Get the Dragonfly resource and record the last config applied time
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      hardenClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+				Expect(df.Status.Cluster).NotTo(BeNil())
+				Expect(df.Status.Cluster.LastConfigAppliedAt).NotTo(BeNil())
+
+				lastApplied := df.Status.Cluster.LastConfigAppliedAt.Time
+				configHash := df.Status.Cluster.ConfigHash
+
+				// Get a pod and mutate its role label to trigger reconcile
+				var pods corev1.PodList
+				err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: hardenClusterName,
+					resources.RoleLabelKey:          resources.Replica,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).NotTo(BeEmpty())
+
+				targetPod := &pods.Items[0]
+				originalRole := targetPod.Labels[resources.RoleLabelKey]
+
+				// Patch the pod's role label to simulate a "config drift" scenario
+				// This triggers reconciliation
+				patchFrom := client.MergeFrom(targetPod.DeepCopy())
+				targetPod.Labels["test-trigger"] = "force-reconcile"
+				err = k8sClient.Patch(ctx, targetPod, patchFrom)
+				Expect(err).To(BeNil())
+
+				// Immediately check that LastConfigAppliedAt has NOT changed
+				// (within cooldown window of 30s)
+				Consistently(func() (time.Time, error) {
+					var dfCheck resourcesv1.Dragonfly
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      hardenClusterName,
+						Namespace: namespace,
+					}, &dfCheck)
+					if err != nil {
+						return time.Time{}, err
+					}
+					if dfCheck.Status.Cluster == nil || dfCheck.Status.Cluster.LastConfigAppliedAt == nil {
+						return time.Time{}, fmt.Errorf("cluster status not ready")
+					}
+					return dfCheck.Status.Cluster.LastConfigAppliedAt.Time, nil
+				}, 10*time.Second, 2*time.Second).Should(Equal(lastApplied),
+					"LastConfigAppliedAt should not advance during cooldown")
+
+				// Verify ConfigHash also unchanged
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      hardenClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+				Expect(df.Status.Cluster.ConfigHash).To(Equal(configHash),
+					"ConfigHash should remain unchanged during cooldown")
+
+				// Clean up test label
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      targetPod.Name,
+					Namespace: namespace,
+				}, targetPod)
+				Expect(err).To(BeNil())
+				patchFrom = client.MergeFrom(targetPod.DeepCopy())
+				delete(targetPod.Labels, "test-trigger")
+				targetPod.Labels[resources.RoleLabelKey] = originalRole
+				err = k8sClient.Patch(ctx, targetPod, patchFrom)
+				Expect(err).To(BeNil())
+			})
+
+			AfterAll(func() {
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      hardenClusterName,
+					Namespace: namespace,
+				}, &df)
+				if apierrors.IsNotFound(err) {
+					return
+				}
+				Expect(err).To(BeNil())
+				err = k8sClient.Delete(ctx, &df)
+				Expect(err).To(BeNil())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      hardenClusterName,
+						Namespace: namespace,
+					}, &df)
+					return apierrors.IsNotFound(err)
+				}, 2*time.Minute, 2*time.Second).Should(BeTrue())
+			})
+		})
+
 		AfterAll(func() {
 			// Clean up resources created during the test
 			var df resourcesv1.Dragonfly

@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -45,6 +46,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+// errMasterGracePeriod is returned when a master is unhealthy but still within the grace period.
+var errMasterGracePeriod = errors.New("master is within stability grace period")
 
 // DragonflyInstance is an abstraction over the `Dragonfly` CRD and provides methods to handle replication.
 type DragonflyInstance struct {
@@ -446,42 +450,64 @@ func (dfi *DragonflyInstance) detectOldMasters(ctx context.Context, updateRevisi
 
 // replicaOf configures the pod as a replica to the given master instance
 func (dfi *DragonflyInstance) replicaOf(ctx context.Context, pod *corev1.Pod, masterIp string) error {
-	redisClient := redis.NewClient(&redis.Options{
-		ClientName: resources.DragonflyOperatorName,
-		Addr:       net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
-		MaintNotificationsConfig: &maintnotifications.Config{
-			Mode: maintnotifications.ModeDisabled,
-		},
-	})
-	defer redisClient.Close()
-
-	// Determine if we're switching from master to replica, or just pointing to a new master
-	wasMaster, err := dfi.hasMasterRole(ctx, redisClient)
-	if err != nil {
-		return fmt.Errorf("failed to determine the current role of the instance: %w", err)
-	}
+	podName := pod.Name
+	podIP := pod.Status.PodIP
+	var wasMaster bool
 
 	// Sanitize masterIp in case ipv6
 	masterIp = sanitizeIp(masterIp)
 
-	dfi.log.Info("Trying to invoke SLAVE OF command", "pod", pod.Name, "master", masterIp, "addr", redisClient.Options().Addr)
-	resp, err := redisClient.SlaveOf(ctx, masterIp, strconv.Itoa(int(dfi.adminPort()))).Result()
-	if err != nil {
-		return fmt.Errorf("error running SLAVE OF command: %s", err)
-	}
+	// Retry the Redis SLAVEOF command
+	err := retryWithBackoff(ctx, 3, time.Second, func() error {
+		redisClient := redis.NewClient(&redis.Options{
+			ClientName: resources.DragonflyOperatorName,
+			Addr:       net.JoinHostPort(podIP, strconv.Itoa(int(dfi.adminPort()))),
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode: maintnotifications.ModeDisabled,
+			},
+		})
+		defer redisClient.Close()
 
-	if resp != "OK" {
-		return fmt.Errorf("response of `SLAVE OF` on replica is not OK: %s", resp)
-	}
-
-	if dfi.df.Spec.Snapshot != nil && dfi.df.Spec.Snapshot.EnableOnMasterOnly {
-		dfi.log.Info("clearing snapshot cron schedule on replica", "pod", pod.Name)
-		if _, err := redisClient.ConfigSet(ctx, "snapshot_cron", "").Result(); err != nil {
-			return fmt.Errorf("failed to clear snapshot_cron on replica %s: %w", pod.Name, err)
+		// Determine if we're switching from master to replica, or just pointing to a new master
+		var err error
+		wasMaster, err = dfi.hasMasterRole(ctx, redisClient)
+		if err != nil {
+			dfi.log.Info("retrying hasMasterRole check", "pod", podName, "err", err)
+			return fmt.Errorf("failed to determine the current role of the instance: %w", err)
 		}
+
+		dfi.log.Info("Trying to invoke SLAVE OF command", "pod", podName, "master", masterIp, "addr", redisClient.Options().Addr)
+		resp, err := redisClient.SlaveOf(ctx, masterIp, strconv.Itoa(int(dfi.adminPort()))).Result()
+		if err != nil {
+			dfi.log.Info("retrying SLAVE OF command", "pod", podName, "err", err)
+			return err
+		}
+
+		if resp != "OK" {
+			return fmt.Errorf("response of `SLAVE OF` on replica is not OK: %s", resp)
+		}
+
+		if dfi.df.Spec.Snapshot != nil && dfi.df.Spec.Snapshot.EnableOnMasterOnly {
+			dfi.log.Info("clearing snapshot cron schedule on replica", "pod", podName)
+			if _, err := redisClient.ConfigSet(ctx, "snapshot_cron", "").Result(); err != nil {
+				return fmt.Errorf("failed to clear snapshot_cron on replica %s: %w", podName, err)
+			}
+		}
+
+		if wasMaster {
+			// Prevent clients from sending commands to this old master
+			dfi.disconnectClients(ctx, redisClient, pod)
+		}
+
+		return nil
+	})
+	if err != nil {
+		dfi.eventRecorder.Event(dfi.df, corev1.EventTypeWarning, "FailedToConfigureReplica",
+			fmt.Sprintf("Failed to configure pod %s as replica after retries: %v", podName, err))
+		return fmt.Errorf("error running SLAVE OF command after retries: %w", err)
 	}
 
-	dfi.log.Info("Marking pod role as replica", "pod", pod.Name, "masterIp", masterIp)
+	dfi.log.Info("Marking pod role as replica", "pod", podName, "masterIp", masterIp)
 	pod.Labels[resources.RoleLabelKey] = resources.Replica
 	if pod.Annotations == nil {
 		pod.Annotations = make(map[string]string)
@@ -498,46 +524,54 @@ func (dfi *DragonflyInstance) replicaOf(ctx context.Context, pod *corev1.Pod, ma
 		return fmt.Errorf("could not update replica metadata: %w", err)
 	}
 
-	if wasMaster {
-		// Prevent clients from sending commands to this old master
-		dfi.disconnectClients(ctx, redisClient, pod)
-	}
-
 	return nil
 }
 
 // replicaOfNoOne configures the pod as a master along while updating other pods to be replicas
 func (dfi *DragonflyInstance) replicaOfNoOne(ctx context.Context, pod *corev1.Pod) error {
-	redisClient := redis.NewClient(&redis.Options{
-		ClientName: resources.DragonflyOperatorName,
-		Addr:       net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
-		MaintNotificationsConfig: &maintnotifications.Config{
-			Mode: maintnotifications.ModeDisabled,
-		},
-	})
-	defer redisClient.Close()
+	podName := pod.Name
+	podIP := pod.Status.PodIP
 
-	dfi.log.Info("running SLAVE OF NO ONE command", "pod", pod.Name, "addr", redisClient.Options().Addr)
-	resp, err := redisClient.SlaveOf(ctx, "NO", "ONE").Result()
-	if err != nil {
-		return fmt.Errorf("error running SLAVE OF NO ONE command: %w", err)
-	}
+	// Retry the Redis SLAVEOF NO ONE command
+	err := retryWithBackoff(ctx, 3, time.Second, func() error {
+		redisClient := redis.NewClient(&redis.Options{
+			ClientName: resources.DragonflyOperatorName,
+			Addr:       net.JoinHostPort(podIP, strconv.Itoa(int(dfi.adminPort()))),
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode: maintnotifications.ModeDisabled,
+			},
+		})
+		defer redisClient.Close()
 
-	if resp != "OK" {
-		return fmt.Errorf("response of `SLAVE OF NO ONE` on master is not OK: %s", resp)
-	}
-
-	if dfi.df.Spec.Snapshot != nil && dfi.df.Spec.Snapshot.EnableOnMasterOnly {
-		dfi.log.Info("setting snapshot cron schedule on master", "pod", pod.Name)
-		cron := dfi.df.Spec.Snapshot.Cron
-		if _, err := redisClient.ConfigSet(ctx, "snapshot_cron", cron).Result(); err != nil {
-			return fmt.Errorf("failed to set snapshot_cron on master %s: %w", pod.Name, err)
+		dfi.log.Info("running SLAVE OF NO ONE command", "pod", podName, "addr", redisClient.Options().Addr)
+		resp, err := redisClient.SlaveOf(ctx, "NO", "ONE").Result()
+		if err != nil {
+			dfi.log.Info("retrying SLAVE OF NO ONE", "pod", podName, "err", err)
+			return err
 		}
+
+		if resp != "OK" {
+			return fmt.Errorf("response of `SLAVE OF NO ONE` on master is not OK: %s", resp)
+		}
+
+		if dfi.df.Spec.Snapshot != nil && dfi.df.Spec.Snapshot.EnableOnMasterOnly {
+			dfi.log.Info("setting snapshot cron schedule on master", "pod", podName)
+			cron := dfi.df.Spec.Snapshot.Cron
+			if _, err := redisClient.ConfigSet(ctx, "snapshot_cron", cron).Result(); err != nil {
+				return fmt.Errorf("failed to set snapshot_cron on master %s: %w", podName, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		dfi.eventRecorder.Event(dfi.df, corev1.EventTypeWarning, "FailedToPromoteMaster",
+			fmt.Sprintf("Failed to promote pod %s to master after retries: %v", podName, err))
+		return fmt.Errorf("error running SLAVE OF NO ONE command after retries: %w", err)
 	}
 
-	masterIp := pod.Status.PodIP
+	masterIp := podIP
 
-	dfi.log.Info("Marking pod role as master", "pod", pod.Name, "masterIp", masterIp)
+	dfi.log.Info("Marking pod role as master", "pod", podName, "masterIp", masterIp)
 	pod.Labels[resources.RoleLabelKey] = resources.Master
 	delete(pod.Labels, resources.MasterIpLabelKey)
 
@@ -545,6 +579,7 @@ func (dfi *DragonflyInstance) replicaOfNoOne(ctx context.Context, pod *corev1.Po
 		pod.Annotations = make(map[string]string)
 	}
 	pod.Annotations[resources.MasterIpAnnotationKey] = masterIp
+	pod.Annotations[resources.MasterSinceAnnotationKey] = time.Now().Format(time.RFC3339)
 
 	if err := dfi.client.Update(ctx, pod); err != nil {
 		return err
@@ -725,6 +760,32 @@ func parseInfoToMap(info string) map[string]string {
 		data[key] = value
 	}
 	return data
+}
+
+// retryWithBackoff retries the given function with exponential backoff.
+// It returns the last error if all attempts fail.
+func retryWithBackoff(ctx context.Context, maxAttempts int, baseDelay time.Duration, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if err := fn(); err != nil {
+			lastErr = err
+			if attempt < maxAttempts-1 {
+				delay := baseDelay * time.Duration(1<<attempt) // exponential: baseDelay * 2^attempt
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(delay):
+				}
+			}
+		} else {
+			return nil
+		}
+	}
+	return lastErr
 }
 
 func (dfi *DragonflyInstance) isDatasetLoaded(ctx context.Context, pod *corev1.Pod) (bool, error) {
@@ -1109,6 +1170,10 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 
 		master, err := dfi.ensureShardReplication(ctx, shardName, readyPods)
 		if err != nil {
+			if errors.Is(err, errMasterGracePeriod) {
+				dfi.log.Info("master within grace period, requeuing", "shard", shardName)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
 			return ctrl.Result{}, err
 		}
 		masters[shardName] = master
@@ -1118,6 +1183,8 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
+	const configApplyCooldown = 30 * time.Second
 
 	status := dfi.getStatus()
 	if status.Cluster != nil && status.Cluster.ConfigHash == hash && status.Cluster.ObservedGeneration == dfi.df.Generation {
@@ -1134,6 +1201,16 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 			}
 			return ctrl.Result{}, nil
 		}
+
+		// Check cooldown: if config was applied recently, wait before reapplying
+		if status.Cluster.LastConfigAppliedAt != nil {
+			elapsed := time.Since(status.Cluster.LastConfigAppliedAt.Time)
+			if elapsed < configApplyCooldown {
+				remaining := configApplyCooldown - elapsed
+				dfi.log.Info("cluster config cooldown active, requeue", "remaining", remaining, "dragonfly", dfi.df.Name)
+				return ctrl.Result{RequeueAfter: remaining}, nil
+			}
+		}
 		dfi.log.Info("cluster config missing on one or more nodes; reapplying", "dragonfly", dfi.df.Name)
 	}
 
@@ -1146,9 +1223,11 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 		return ctrl.Result{}, err
 	}
 
+	now := metav1.Now()
 	status.Cluster = &dfv1alpha1.ClusterStatus{
-		ConfigHash:         hash,
-		ObservedGeneration: dfi.df.Generation,
+		ConfigHash:          hash,
+		ObservedGeneration:  dfi.df.Generation,
+		LastConfigAppliedAt: &now,
 	}
 	status.Phase = PhaseReady
 	if err := dfi.patchStatus(ctx, status); err != nil {
@@ -1196,7 +1275,20 @@ func (dfi *DragonflyInstance) ensureShardReplication(ctx context.Context, shardN
 	}
 
 	// Master is unhealthy or doesn't exist - need to promote a new one
+	const masterStabilityGrace = 10 * time.Second
+
 	if currentMaster != nil {
+		// Check grace period: only promote if master has been master long enough
+		// This prevents rapid churn if a newly promoted master is still coming up
+		if masterSinceStr, ok := currentMaster.Annotations[resources.MasterSinceAnnotationKey]; ok {
+			masterSince, err := time.Parse(time.RFC3339, masterSinceStr)
+			if err == nil && time.Since(masterSince) < masterStabilityGrace {
+				dfi.log.Info("master may be transiently unhealthy, waiting for grace period",
+					"shard", shardName, "master", currentMaster.Name, "masterSince", masterSince)
+				// Signal to caller that we need to wait
+				return nil, errMasterGracePeriod
+			}
+		}
 		dfi.log.Info("shard master is unhealthy, initiating failover", "shard", shardName, "master", currentMaster.Name)
 		dfi.eventRecorder.Event(dfi.df, corev1.EventTypeWarning, "MasterUnhealthy", fmt.Sprintf("Shard %s master %s is unhealthy, initiating failover", shardName, currentMaster.Name))
 	} else {
@@ -1619,19 +1711,29 @@ func (dfi *DragonflyInstance) buildClusterConfig(ctx context.Context, masters ma
 
 func (dfi *DragonflyInstance) applyClusterConfig(ctx context.Context, config string, pods []*corev1.Pod) error {
 	for _, pod := range pods {
-		redisClient := redis.NewClient(&redis.Options{
-			ClientName: resources.DragonflyOperatorName,
-			Addr:       net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
-			MaintNotificationsConfig: &maintnotifications.Config{
-				Mode: maintnotifications.ModeDisabled,
-			},
-		})
+		podName := pod.Name
+		podIP := pod.Status.PodIP
+		err := retryWithBackoff(ctx, 3, time.Second, func() error {
+			redisClient := redis.NewClient(&redis.Options{
+				ClientName: resources.DragonflyOperatorName,
+				Addr:       net.JoinHostPort(podIP, strconv.Itoa(int(dfi.adminPort()))),
+				MaintNotificationsConfig: &maintnotifications.Config{
+					Mode: maintnotifications.ModeDisabled,
+				},
+			})
+			defer redisClient.Close()
 
-		if _, err := redisClient.Do(ctx, "DFLYCLUSTER", "CONFIG", config).Result(); err != nil {
-			redisClient.Close()
-			return fmt.Errorf("failed to apply cluster config on pod %s: %w", pod.Name, err)
+			if _, err := redisClient.Do(ctx, "DFLYCLUSTER", "CONFIG", config).Result(); err != nil {
+				dfi.log.Info("retrying DFLYCLUSTER CONFIG", "pod", podName, "err", err)
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			dfi.eventRecorder.Event(dfi.df, corev1.EventTypeWarning, "FailedToApplyClusterConfig",
+				fmt.Sprintf("Failed to apply cluster config on pod %s after retries: %v", podName, err))
+			return fmt.Errorf("failed to apply cluster config on pod %s after retries: %w", podName, err)
 		}
-		redisClient.Close()
 	}
 
 	return nil
@@ -1670,23 +1772,35 @@ func (dfi *DragonflyInstance) isNodeConfigured(ctx context.Context, pod *corev1.
 }
 
 func (dfi *DragonflyInstance) getClusterNodeInfo(ctx context.Context, pod *corev1.Pod) (clusterNode, error) {
-	client := redis.NewClient(&redis.Options{
-		ClientName: resources.DragonflyOperatorName,
-		Addr:       net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(dfi.adminPort()))),
-		MaintNotificationsConfig: &maintnotifications.Config{
-			Mode: maintnotifications.ModeDisabled,
-		},
-	})
-	defer client.Close()
+	podName := pod.Name
+	podIP := pod.Status.PodIP
+	var nodeID string
 
-	id, err := client.Do(ctx, "CLUSTER", "MYID").Text()
+	err := retryWithBackoff(ctx, 2, 500*time.Millisecond, func() error {
+		client := redis.NewClient(&redis.Options{
+			ClientName: resources.DragonflyOperatorName,
+			Addr:       net.JoinHostPort(podIP, strconv.Itoa(int(dfi.adminPort()))),
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode: maintnotifications.ModeDisabled,
+			},
+		})
+		defer client.Close()
+
+		id, err := client.Do(ctx, "CLUSTER", "MYID").Text()
+		if err != nil {
+			dfi.log.Info("retrying CLUSTER MYID", "pod", podName, "err", err)
+			return err
+		}
+		nodeID = id
+		return nil
+	})
 	if err != nil {
-		return clusterNode{}, err
+		return clusterNode{}, fmt.Errorf("failed to get cluster node info after retries: %w", err)
 	}
 
 	return clusterNode{
-		ID:   id,
-		IP:   pod.Status.PodIP,
+		ID:   nodeID,
+		IP:   podIP,
 		Port: resources.DragonflyPort,
 	}, nil
 }
