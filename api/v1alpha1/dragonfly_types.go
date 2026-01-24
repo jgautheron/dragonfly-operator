@@ -329,6 +329,15 @@ type DragonflyStatus struct {
 }
 
 // ClusterStatus tracks the multi-shard cluster state.
+// ShardMasterInfo tracks the current master for a shard and when it was promoted.
+type ShardMasterInfo struct {
+	// PodName is the name of the current master pod for this shard.
+	PodName string `json:"podName,omitempty"`
+	// MasterSince is when this pod became master. Used for grace period tracking.
+	// +optional
+	MasterSince *metav1.Time `json:"masterSince,omitempty"`
+}
+
 type ClusterStatus struct {
 	// ConfigHash is the hash of the last applied DFLYCLUSTER CONFIG payload.
 	ConfigHash string `json:"configHash,omitempty"`
@@ -337,6 +346,10 @@ type ClusterStatus struct {
 	// LastConfigAppliedAt indicates when the cluster config was last applied.
 	// +optional
 	LastConfigAppliedAt *metav1.Time `json:"lastConfigAppliedAt,omitempty"`
+	// ShardMasters tracks the current master for each shard and when it was promoted.
+	// Key is the shard name (e.g., "shard-0").
+	// +optional
+	ShardMasters map[string]ShardMasterInfo `json:"shardMasters,omitempty"`
 }
 
 //+kubebuilder:object:root=true

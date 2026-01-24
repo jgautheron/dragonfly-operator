@@ -7097,6 +7097,26 @@ spec:
                       the status represents.
                     format: int64
                     type: integer
+                  shardMasters:
+                    additionalProperties:
+                      description: |-
+                        ClusterStatus tracks the multi-shard cluster state.
+                        ShardMasterInfo tracks the current master for a shard and when it was promoted.
+                      properties:
+                        masterSince:
+                          description: MasterSince is when this pod became master.
+                            Used for grace period tracking.
+                          format: date-time
+                          type: string
+                        podName:
+                          description: PodName is the name of the current master pod
+                            for this shard.
+                          type: string
+                      type: object
+                    description: |-
+                      ShardMasters tracks the current master for each shard and when it was promoted.
+                      Key is the shard name (e.g., "shard-0").
+                    type: object
                 type: object
               conditions:
                 description: Conditions provides high-level state tracking.

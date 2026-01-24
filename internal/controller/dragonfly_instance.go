@@ -407,6 +407,52 @@ func (dfi *DragonflyInstance) patchStatus(ctx context.Context, status dfv1alpha1
 	return nil
 }
 
+// updateShardMasterStatus updates the CR status with the new master info for a shard.
+// This persists the masterSince timestamp so grace period survives pod deletion.
+func (dfi *DragonflyInstance) updateShardMasterStatus(ctx context.Context, shardName string, masterPodName string) error {
+	patchFrom := client.MergeFrom(dfi.df.DeepCopy())
+
+	// Initialize cluster status if needed
+	if dfi.df.Status.Cluster == nil {
+		dfi.df.Status.Cluster = &dfv1alpha1.ClusterStatus{}
+	}
+	if dfi.df.Status.Cluster.ShardMasters == nil {
+		dfi.df.Status.Cluster.ShardMasters = make(map[string]dfv1alpha1.ShardMasterInfo)
+	}
+
+	now := metav1.Now()
+	dfi.df.Status.Cluster.ShardMasters[shardName] = dfv1alpha1.ShardMasterInfo{
+		PodName:     masterPodName,
+		MasterSince: &now,
+	}
+
+	dfi.log.Info("updating shard master status", "shard", shardName, "master", masterPodName, "masterSince", now)
+
+	if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+		return fmt.Errorf("failed to update shard master status: %w", err)
+	}
+
+	return nil
+}
+
+// getShardMasterSince retrieves the masterSince timestamp for a shard from CR status.
+// Returns nil if no info exists for the shard.
+func (dfi *DragonflyInstance) getShardMasterSince(shardName string, masterPodName string) *metav1.Time {
+	if dfi.df.Status.Cluster == nil || dfi.df.Status.Cluster.ShardMasters == nil {
+		return nil
+	}
+	info, ok := dfi.df.Status.Cluster.ShardMasters[shardName]
+	if !ok {
+		return nil
+	}
+	// Only return the timestamp if it's for the same master pod
+	// (if a different pod is master, the old timestamp is stale)
+	if info.PodName != masterPodName {
+		return nil
+	}
+	return info.MasterSince
+}
+
 func (dfi *DragonflyInstance) adminPort() int32 {
 	if dfi.df.Spec.Cluster != nil && dfi.df.Spec.Cluster.AdminPort != 0 {
 		return dfi.df.Spec.Cluster.AdminPort
@@ -1277,15 +1323,27 @@ func (dfi *DragonflyInstance) ensureShardReplication(ctx context.Context, shardN
 	// Master is unhealthy or doesn't exist - need to promote a new one
 	const masterStabilityGrace = 10 * time.Second
 
+	// Check grace period from CR status first (persists across pod deletion)
+	// This prevents rapid failover churn even if the master pod was deleted
+	if dfi.df.Status.Cluster != nil && dfi.df.Status.Cluster.ShardMasters != nil {
+		if shardInfo, ok := dfi.df.Status.Cluster.ShardMasters[shardName]; ok && shardInfo.MasterSince != nil {
+			masterSince := shardInfo.MasterSince.Time
+			if time.Since(masterSince) < masterStabilityGrace {
+				dfi.log.Info("master was recently promoted, waiting for grace period",
+					"shard", shardName, "lastMaster", shardInfo.PodName, "masterSince", masterSince)
+				return nil, errMasterGracePeriod
+			}
+		}
+	}
+
+	// Fall back to checking pod annotation if CR status not available
 	if currentMaster != nil {
-		// Check grace period: only promote if master has been master long enough
-		// This prevents rapid churn if a newly promoted master is still coming up
+		// Check grace period from pod annotation
 		if masterSinceStr, ok := currentMaster.Annotations[resources.MasterSinceAnnotationKey]; ok {
 			masterSince, err := time.Parse(time.RFC3339, masterSinceStr)
 			if err == nil && time.Since(masterSince) < masterStabilityGrace {
 				dfi.log.Info("master may be transiently unhealthy, waiting for grace period",
 					"shard", shardName, "master", currentMaster.Name, "masterSince", masterSince)
-				// Signal to caller that we need to wait
 				return nil, errMasterGracePeriod
 			}
 		}
@@ -1334,6 +1392,10 @@ func (dfi *DragonflyInstance) ensureShardReplication(ctx context.Context, shardN
 			dfi.log.Info("REPLTAKEOVER failed, falling back to SLAVEOF NO ONE", "shard", shardName, "err", err)
 			// Fall through to force promotion
 		} else {
+			// Persist master promotion time to CR status for grace period tracking
+			if err := dfi.updateShardMasterStatus(ctx, shardName, newMaster.Name); err != nil {
+				dfi.log.Error(err, "failed to update shard master status, grace period tracking may be incomplete", "shard", shardName)
+			}
 			dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "MasterPromoted", fmt.Sprintf("Shard %s: promoted %s to master via REPLTAKEOVER", shardName, newMaster.Name))
 			// Configure remaining pods as replicas
 			for _, pod := range pods {
@@ -1356,6 +1418,12 @@ func (dfi *DragonflyInstance) ensureShardReplication(ctx context.Context, shardN
 	dfi.log.Info("promoting new master via SLAVEOF NO ONE", "shard", shardName, "newMaster", newMaster.Name)
 	if err := dfi.replicaOfNoOne(ctx, newMaster); err != nil {
 		return nil, fmt.Errorf("failed to promote master in shard %s: %w", shardName, err)
+	}
+
+	// Persist master promotion time to CR status for grace period tracking
+	if err := dfi.updateShardMasterStatus(ctx, shardName, newMaster.Name); err != nil {
+		dfi.log.Error(err, "failed to update shard master status, grace period tracking may be incomplete", "shard", shardName)
+		// Don't fail the operation, just log the error
 	}
 
 	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "MasterPromoted", fmt.Sprintf("Shard %s: promoted %s to master", shardName, newMaster.Name))
@@ -1408,6 +1476,11 @@ func (dfi *DragonflyInstance) resolveSplitBrain(ctx context.Context, shardName s
 	// Ensure elected master is actually master
 	if err := dfi.replicaOfNoOne(ctx, electedMaster); err != nil {
 		return nil, fmt.Errorf("failed to confirm master in shard %s: %w", shardName, err)
+	}
+
+	// Persist master promotion time to CR status for grace period tracking
+	if err := dfi.updateShardMasterStatus(ctx, shardName, electedMaster.Name); err != nil {
+		dfi.log.Error(err, "failed to update shard master status, grace period tracking may be incomplete", "shard", shardName)
 	}
 
 	// Demote all other pods to replicas
