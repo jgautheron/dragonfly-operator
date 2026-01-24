@@ -167,6 +167,12 @@ func generateClusterResources(df *resourcesv1.Dragonfly, defaultDragonflyImage s
 		replicasPerShard = 1
 	}
 
+	// Check if master anti-affinity is enabled (default: true)
+	masterAntiAffinity := true
+	if df.Spec.Cluster.MasterAntiAffinity != nil {
+		masterAntiAffinity = *df.Spec.Cluster.MasterAntiAffinity
+	}
+
 	for i := int32(0); i < df.Spec.Cluster.Shards; i++ {
 		shardName := fmt.Sprintf("shard-%d", i)
 		shardSelector := map[string]string{
@@ -179,6 +185,11 @@ func generateClusterResources(df *resourcesv1.Dragonfly, defaultDragonflyImage s
 		statefulset := buildStatefulSet(df, statefulsetName, serviceName, replicasPerShard, shardSelector, image)
 		if err := applyStatefulSetCustomizations(df, &statefulset); err != nil {
 			return nil, err
+		}
+
+		// Apply master anti-affinity for cluster mode
+		if masterAntiAffinity {
+			applyClusterAntiAffinity(df, &statefulset)
 		}
 		resources = append(resources, &statefulset)
 
@@ -767,4 +778,56 @@ func generateResourceAnnotations(df *resourcesv1.Dragonfly) map[string]string {
 	}
 
 	return annotations
+}
+
+// applyClusterAntiAffinity adds pod anti-affinity rules for cluster mode to spread
+// pods from different shards across nodes. This ensures high availability by
+// preventing all shard masters from running on the same node.
+func applyClusterAntiAffinity(df *resourcesv1.Dragonfly, statefulset *appsv1.StatefulSet) {
+	// Create preferred anti-affinity to spread pods across nodes
+	// We use "preferred" instead of "required" to avoid blocking scheduling
+	// when there aren't enough nodes
+	antiAffinityTerm := corev1.WeightedPodAffinityTerm{
+		Weight: 100,
+		PodAffinityTerm: corev1.PodAffinityTerm{
+			LabelSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					DragonflyNameLabelKey:     df.Name,
+					KubernetesAppNameLabelKey: KubernetesAppName,
+				},
+			},
+			TopologyKey: "kubernetes.io/hostname",
+		},
+	}
+
+	podSpec := &statefulset.Spec.Template.Spec
+
+	// If user has specified affinity, we need to create a new Affinity object
+	// to avoid mutating the shared spec object across multiple shards
+	if podSpec.Affinity == nil {
+		podSpec.Affinity = &corev1.Affinity{}
+	} else {
+		// Deep copy the affinity to avoid mutating the shared spec
+		newAffinity := &corev1.Affinity{}
+		if podSpec.Affinity.NodeAffinity != nil {
+			newAffinity.NodeAffinity = podSpec.Affinity.NodeAffinity.DeepCopy()
+		}
+		if podSpec.Affinity.PodAffinity != nil {
+			newAffinity.PodAffinity = podSpec.Affinity.PodAffinity.DeepCopy()
+		}
+		if podSpec.Affinity.PodAntiAffinity != nil {
+			newAffinity.PodAntiAffinity = podSpec.Affinity.PodAntiAffinity.DeepCopy()
+		}
+		podSpec.Affinity = newAffinity
+	}
+
+	if podSpec.Affinity.PodAntiAffinity == nil {
+		podSpec.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{}
+	}
+
+	// Append our anti-affinity rule to any existing preferred rules
+	podSpec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
+		podSpec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution,
+		antiAffinityTerm,
+	)
 }

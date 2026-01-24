@@ -4283,6 +4283,13 @@ spec:
                       Defaults to 9999 when unset.
                     format: int32
                     type: integer
+                  masterAntiAffinity:
+                    default: true
+                    description: |-
+                      MasterAntiAffinity enables automatic pod anti-affinity to spread shard pods
+                      across different nodes. This helps ensure masters from different shards
+                      run on different nodes for high availability. Defaults to true.
+                    type: boolean
                   mode:
                     description: Mode selects the Dragonfly cluster mode implementation.
                     enum:

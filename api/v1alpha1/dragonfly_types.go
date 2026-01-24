@@ -215,6 +215,13 @@ type ClusterSpec struct {
 	// +kubebuilder:default:=1
 	// +kubebuilder:validation:Minimum=1
 	ReplicasPerShard int32 `json:"replicasPerShard,omitempty"`
+
+	// MasterAntiAffinity enables automatic pod anti-affinity to spread shard pods
+	// across different nodes. This helps ensure masters from different shards
+	// run on different nodes for high availability. Defaults to true.
+	// +optional
+	// +kubebuilder:default:=true
+	MasterAntiAffinity *bool `json:"masterAntiAffinity,omitempty"`
 }
 
 // SlotRange describes a hash slot interval owned by a shard (used internally).
