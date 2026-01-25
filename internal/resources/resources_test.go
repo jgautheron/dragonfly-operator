@@ -223,3 +223,188 @@ func TestClusterAntiAffinityMergesWithUserAffinity(t *testing.T) {
 		assert.Len(t, affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution, 1)
 	}
 }
+
+func TestComputeShardSnapshotDir(t *testing.T) {
+	tests := []struct {
+		name        string
+		basePath    string
+		clusterName string
+		shardName   string
+		expected    string
+	}{
+		{
+			name:        "non-cluster mode returns base path",
+			basePath:    "/dragonfly/snapshots",
+			clusterName: "my-cluster",
+			shardName:   "",
+			expected:    "/dragonfly/snapshots",
+		},
+		{
+			name:        "cluster mode with local path",
+			basePath:    "/dragonfly/snapshots",
+			clusterName: "my-cluster",
+			shardName:   "shard-0",
+			expected:    "/dragonfly/snapshots/my-cluster/shard-0",
+		},
+		{
+			name:        "cluster mode with S3 path",
+			basePath:    "s3://my-bucket/backups",
+			clusterName: "my-cluster",
+			shardName:   "shard-1",
+			expected:    "s3://my-bucket/backups/my-cluster/shard-1",
+		},
+		{
+			name:        "cluster mode with S3 path trailing slash",
+			basePath:    "s3://my-bucket/backups/",
+			clusterName: "my-cluster",
+			shardName:   "shard-2",
+			expected:    "s3://my-bucket/backups/my-cluster/shard-2",
+		},
+		{
+			name:        "cluster mode with local path trailing slash",
+			basePath:    "/dragonfly/snapshots/",
+			clusterName: "test-cluster",
+			shardName:   "shard-0",
+			expected:    "/dragonfly/snapshots/test-cluster/shard-0",
+		},
+		{
+			name:        "cluster mode with nested S3 path",
+			basePath:    "s3://my-bucket/env/prod/dragonfly",
+			clusterName: "prod-cluster",
+			shardName:   "shard-3",
+			expected:    "s3://my-bucket/env/prod/dragonfly/prod-cluster/shard-3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ComputeShardSnapshotDir(tt.basePath, tt.clusterName, tt.shardName)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestClusterModeSnapshotPaths(t *testing.T) {
+	// Test that cluster mode generates shard-aware snapshot paths
+	df := &resourcesv1.Dragonfly{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "dragonflydb.io/v1alpha1", Kind: "Dragonfly"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", UID: "123"},
+		Spec: resourcesv1.DragonflySpec{
+			Cluster: &resourcesv1.ClusterSpec{
+				Mode:             resourcesv1.ClusterModeMultiShard,
+				Shards:           2,
+				ReplicasPerShard: 1,
+			},
+			Snapshot: &resourcesv1.Snapshot{
+				Dir:  "s3://my-bucket/snapshots",
+				Cron: "0 * * * *",
+			},
+		},
+	}
+
+	objs, err := GenerateDragonflyResources(df, "")
+	assert.NoError(t, err)
+
+	// Check that each StatefulSet has shard-specific snapshot dir
+	shardDirs := make(map[string]string)
+	for _, obj := range objs {
+		sts, ok := obj.(*appsv1.StatefulSet)
+		if !ok {
+			continue
+		}
+
+		// Find the --dir arg
+		container := sts.Spec.Template.Spec.Containers[0]
+		var dirArg string
+		for _, arg := range container.Args {
+			if len(arg) > 6 && arg[:6] == "--dir=" {
+				dirArg = arg[6:]
+				break
+			}
+		}
+
+		shardName := sts.Spec.Selector.MatchLabels[ShardNameLabelKey]
+		assert.NotEmpty(t, dirArg, "statefulset should have --dir arg")
+		shardDirs[shardName] = dirArg
+
+		// Verify the path includes the shard name
+		expectedPath := "s3://my-bucket/snapshots/test-cluster/" + shardName
+		assert.Equal(t, expectedPath, dirArg, "snapshot dir should be shard-specific")
+	}
+
+	// Verify we have paths for both shards
+	assert.Len(t, shardDirs, 2)
+	assert.Contains(t, shardDirs, "shard-0")
+	assert.Contains(t, shardDirs, "shard-1")
+}
+
+func TestClusterModeDoesNotSetSnapshotCron(t *testing.T) {
+	// In cluster mode, the operator manages backups, so snapshot_cron should NOT be set
+	df := &resourcesv1.Dragonfly{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "dragonflydb.io/v1alpha1", Kind: "Dragonfly"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", UID: "123"},
+		Spec: resourcesv1.DragonflySpec{
+			Cluster: &resourcesv1.ClusterSpec{
+				Mode:             resourcesv1.ClusterModeMultiShard,
+				Shards:           2,
+				ReplicasPerShard: 1,
+			},
+			Snapshot: &resourcesv1.Snapshot{
+				Dir:  "/dragonfly/snapshots",
+				Cron: "0 * * * *",
+			},
+		},
+	}
+
+	objs, err := GenerateDragonflyResources(df, "")
+	assert.NoError(t, err)
+
+	for _, obj := range objs {
+		sts, ok := obj.(*appsv1.StatefulSet)
+		if !ok {
+			continue
+		}
+
+		container := sts.Spec.Template.Spec.Containers[0]
+		for _, arg := range container.Args {
+			assert.NotContains(t, arg, "--snapshot_cron",
+				"cluster mode should not set snapshot_cron, operator manages backups")
+		}
+	}
+}
+
+func TestNonClusterModeSetsSnapshotCron(t *testing.T) {
+	// In non-cluster mode, snapshot_cron should be passed to the server
+	df := &resourcesv1.Dragonfly{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "dragonflydb.io/v1alpha1", Kind: "Dragonfly"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "123"},
+		Spec: resourcesv1.DragonflySpec{
+			Replicas: 3,
+			Snapshot: &resourcesv1.Snapshot{
+				Dir:  "/dragonfly/snapshots",
+				Cron: "0 * * * *",
+			},
+		},
+	}
+
+	objs, err := GenerateDragonflyResources(df, "")
+	assert.NoError(t, err)
+
+	var found bool
+	for _, obj := range objs {
+		sts, ok := obj.(*appsv1.StatefulSet)
+		if !ok {
+			continue
+		}
+
+		container := sts.Spec.Template.Spec.Containers[0]
+		for _, arg := range container.Args {
+			if arg == "--snapshot_cron=0 * * * *" {
+				found = true
+				break
+			}
+		}
+	}
+
+	assert.True(t, found, "non-cluster mode should set snapshot_cron")
+}

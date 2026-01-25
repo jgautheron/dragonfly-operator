@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	corev1 "k8s.io/api/core/v1"
@@ -112,11 +113,25 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if !podReady {
+		loading, err := dfi.updateNonClusterPhase(ctx)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update dragonfly phase: %w", err)
+		}
+		if loading {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 		return ctrl.Result{}, nil
 	}
 
 	if roleExists(&pod) {
 		if dfi.getStatus().Phase != PhaseReady && dfi.getStatus().Phase != PhaseReadyOld {
+			loading, err := dfi.updateNonClusterPhase(ctx)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to update dragonfly phase: %w", err)
+			}
+			if loading {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
 			return ctrl.Result{}, nil
 		}
 
@@ -136,6 +151,14 @@ func (r *DfPodLifeCycleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		r.EventRecorder.Event(dfi.df, corev1.EventTypeNormal, "Replication", "Configured a new replica")
+	}
+
+	loading, err := dfi.updateNonClusterPhase(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update dragonfly phase: %w", err)
+	}
+	if loading {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	return ctrl.Result{}, nil

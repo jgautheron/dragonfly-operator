@@ -876,6 +876,59 @@ func (dfi *DragonflyInstance) isPodReady(ctx context.Context, pod *corev1.Pod) (
 	return loaded, nil
 }
 
+func (dfi *DragonflyInstance) updateNonClusterPhase(ctx context.Context) (bool, error) {
+	if dfi.df.Spec.Snapshot == nil {
+		return false, nil
+	}
+
+	pods, err := dfi.getPods(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to get dragonfly pods: %w", err)
+	}
+
+	allReady := true
+	needsLoadingGate := false
+	for _, pod := range pods.Items {
+		if !roleExists(&pod) {
+			allReady = false
+		}
+
+		if !isRunningAndReady(&pod) || isTerminating(&pod) {
+			allReady = false
+			continue
+		}
+
+		loaded, readyErr := dfi.isDatasetLoaded(ctx, &pod)
+		if readyErr != nil {
+			return false, fmt.Errorf("failed to verify pod readiness: %w", readyErr)
+		}
+		if !loaded {
+			allReady = false
+			needsLoadingGate = true
+		}
+	}
+
+	status := dfi.getStatus()
+	if allReady {
+		if status.Phase != PhaseReady && status.Phase != PhaseReadyOld {
+			status.Phase = PhaseReady
+			if err := dfi.patchStatus(ctx, status); err != nil {
+				return false, fmt.Errorf("failed to update status: %w", err)
+			}
+		}
+		return false, nil
+	}
+
+	if needsLoadingGate && status.Phase == PhaseReady {
+		status.Phase = PhaseConfiguring
+		if err := dfi.patchStatus(ctx, status); err != nil {
+			return false, fmt.Errorf("failed to update status: %w", err)
+		}
+	}
+
+	return needsLoadingGate, nil
+}
+
 // detectRollingUpdate checks whether the pod spec has changed and performs a rolling update if needed
 func (dfi *DragonflyInstance) detectRollingUpdate(ctx context.Context) (dfv1alpha1.DragonflyStatus, error) {
 	dfi.log.Info("checking if pod spec has changed")
@@ -1239,6 +1292,28 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 			return ctrl.Result{}, err
 		}
 		if allConfigured {
+			if err := dfi.initializeRestoreState(ctx); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to initialize restore state: %w", err)
+			}
+
+			// Check coordinated restore status before marking ready
+			restoreComplete, err := dfi.reconcileClusterRestore(ctx, masters)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to check restore status: %w", err)
+			}
+			if !restoreComplete {
+				dfi.log.Info("waiting for coordinated restore to complete")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
+			// Handle coordinated backup orchestration for cluster mode
+			if result, err := dfi.reconcileClusterBackup(ctx, masters); err != nil {
+				dfi.log.Error(err, "failed to reconcile cluster backup")
+				// Don't fail the entire reconciliation for backup errors
+			} else if result.RequeueAfter > 0 {
+				return result, nil
+			}
+
 			if status.Phase != PhaseReady {
 				status.Phase = PhaseReady
 				if err := dfi.patchStatus(ctx, status); err != nil {
@@ -1270,17 +1345,20 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 	}
 
 	now := metav1.Now()
-	status.Cluster = &dfv1alpha1.ClusterStatus{
-		ConfigHash:          hash,
-		ObservedGeneration:  dfi.df.Generation,
-		LastConfigAppliedAt: &now,
+	// Preserve existing ClusterStatus fields when updating config-related fields
+	if status.Cluster == nil {
+		status.Cluster = &dfv1alpha1.ClusterStatus{}
 	}
+	status.Cluster.ConfigHash = hash
+	status.Cluster.ObservedGeneration = dfi.df.Generation
+	status.Cluster.LastConfigAppliedAt = &now
 	status.Phase = PhaseReady
 	if err := dfi.patchStatus(ctx, status); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to update status: %w", err)
 	}
 
 	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "ClusterConfigured", "Applied Dragonfly cluster configuration")
+
 	return ctrl.Result{}, nil
 }
 
@@ -1403,7 +1481,7 @@ func (dfi *DragonflyInstance) ensureShardReplication(ctx context.Context, shardN
 					continue
 				}
 				// Skip the old master - it will be reconfigured when it comes back
-				if currentMaster != nil && pod.Name == currentMaster.Name {
+				if pod.Name == currentMaster.Name {
 					continue
 				}
 				if err := dfi.configureReplica(ctx, pod, newMaster.Status.PodIP); err != nil {

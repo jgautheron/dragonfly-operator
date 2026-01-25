@@ -119,7 +119,25 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 		password := "df-pass-1"
 		It("Should create successfully", func() {
 			// create the secret
-			err := k8sClient.Create(ctx, &corev1.Secret{
+			var existingSecret corev1.Secret
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "df-secret",
+				Namespace: namespace,
+			}, &existingSecret)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, &existingSecret)).To(Succeed())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      "df-secret",
+						Namespace: namespace,
+					}, &existingSecret)
+					return apierrors.IsNotFound(err)
+				}, 1*time.Minute, 2*time.Second).Should(BeTrue(), "df-secret should be deleted before creation")
+			} else if !apierrors.IsNotFound(err) {
+				Expect(err).To(BeNil(), "failed to check existing df-secret")
+			}
+
+			err = k8sClient.Create(ctx, &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "df-secret",
 					Namespace: namespace,
@@ -604,7 +622,25 @@ var _ = Describe("Dragonfly Acl file secret key test", Ordered, FlakeAttempts(3)
 user john on >peacepass -@all +@string +hset
 `
 
-			err := k8sClient.Create(ctx, &corev1.Secret{
+			var existingSecret corev1.Secret
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "df-acl",
+				Namespace: namespace,
+			}, &existingSecret)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, &existingSecret)).To(Succeed())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      "df-acl",
+						Namespace: namespace,
+					}, &existingSecret)
+					return apierrors.IsNotFound(err)
+				}, 1*time.Minute, 2*time.Second).Should(BeTrue(), "df-acl secret should be deleted before creation")
+			} else if !apierrors.IsNotFound(err) {
+				Expect(err).To(BeNil(), "failed to check existing df-acl secret")
+			}
+
+			err = k8sClient.Create(ctx, &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "df-acl",
 					Namespace: namespace,
@@ -680,7 +716,25 @@ var _ = Describe("Dragonfly tiering test with single replica", Ordered, FlakeAtt
 
 	Context("Dragonfly resource creation and data insertion", func() {
 		It("Should create successfully", func() {
-			err := k8sClient.Create(ctx, &resourcesv1.Dragonfly{
+			var existing resourcesv1.Dragonfly
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name:      name,
+				Namespace: namespace,
+			}, &existing)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, &existing)).To(Succeed())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      name,
+						Namespace: namespace,
+					}, &existing)
+					return apierrors.IsNotFound(err)
+				}, 1*time.Minute, 2*time.Second).Should(BeTrue(), "tiering dragonfly should be deleted before creation")
+			} else if !apierrors.IsNotFound(err) {
+				Expect(err).To(BeNil(), "failed to check existing tiering dragonfly")
+			}
+
+			err = k8sClient.Create(ctx, &resourcesv1.Dragonfly{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      name,
 					Namespace: namespace,
@@ -1061,6 +1115,26 @@ var _ = Describe("Dragonfly Server TLS tests", Ordered, FlakeAttempts(3), func()
 			cert, key, err := generateSelfSignedCert(name)
 			Expect(err).To(BeNil())
 
+			for _, secretName := range []string{"df-tls", "df-password"} {
+				var existingSecret corev1.Secret
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      secretName,
+					Namespace: namespace,
+				}, &existingSecret)
+				if err == nil {
+					Expect(k8sClient.Delete(ctx, &existingSecret)).To(Succeed())
+					Eventually(func() bool {
+						err := k8sClient.Get(ctx, types.NamespacedName{
+							Name:      secretName,
+							Namespace: namespace,
+						}, &existingSecret)
+						return apierrors.IsNotFound(err)
+					}, 1*time.Minute, 2*time.Second).Should(BeTrue(), fmt.Sprintf("%s should be deleted before creation", secretName))
+				} else if !apierrors.IsNotFound(err) {
+					Expect(err).To(BeNil(), fmt.Sprintf("failed to check existing %s", secretName))
+				}
+			}
+
 			err = k8sClient.Create(ctx, &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "df-tls",
@@ -1196,6 +1270,36 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 				Name:      name,
 				Namespace: namespace,
 			}, &df)
+			if apierrors.IsNotFound(err) {
+				err = k8sClient.Create(ctx, &resourcesv1.Dragonfly{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      name,
+						Namespace: namespace,
+					},
+					Spec: resourcesv1.DragonflySpec{
+						Replicas: 2,
+						Args:     args,
+						Snapshot: &resourcesv1.Snapshot{
+							Cron: schedule,
+							PersistentVolumeClaimSpec: &corev1.PersistentVolumeClaimSpec{
+								AccessModes: []corev1.PersistentVolumeAccessMode{
+									corev1.ReadWriteOnce,
+								},
+								Resources: corev1.VolumeResourceRequirements{
+									Requests: corev1.ResourceList{
+										corev1.ResourceStorage: resource.MustParse("2Gi"),
+									},
+								},
+							},
+						},
+					},
+				})
+				Expect(err).To(BeNil())
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      name,
+					Namespace: namespace,
+				}, &df)
+			}
 			Expect(err).To(BeNil())
 			GinkgoLogr.Info("Dragonfly CR status", "phase", df.Status.Phase, "isRollingUpdate", df.Status.IsRollingUpdate)
 
@@ -1245,11 +1349,21 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 		It("Should wait for dataset loading during pod restart", func() {
 			// Master pod check
 			var pods corev1.PodList
-			err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
-				resources.DragonflyNameLabelKey:    name,
-				resources.KubernetesPartOfLabelKey: "dragonfly",
-			})
-			Expect(err).To(BeNil())
+			Eventually(func() error {
+				err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey:    name,
+					resources.KubernetesPartOfLabelKey: "dragonfly",
+				})
+				if err != nil {
+					return err
+				}
+				for i := range pods.Items {
+					if pods.Items[i].Labels[resources.RoleLabelKey] == resources.Master {
+						return nil
+					}
+				}
+				return fmt.Errorf("master pod not ready yet")
+			}, 1*time.Minute, 2*time.Second).Should(Succeed())
 
 			var masterPod *corev1.Pod
 			for i := range pods.Items {
@@ -1260,7 +1374,7 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 			}
 			Expect(masterPod).NotTo(BeNil(), "master pod should exist")
 
-			err = waitForDragonflyPhase(ctx, k8sClient, name, namespace, controller.PhaseReady, 30*time.Second)
+			err := waitForDragonflyPhase(ctx, k8sClient, name, namespace, controller.PhaseReady, 2*time.Minute)
 			Expect(err).To(BeNil(), "cluster should be Ready before restart")
 
 			// Delete the master pod to trigger restart

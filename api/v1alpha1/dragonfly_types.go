@@ -345,6 +345,63 @@ type ShardMasterInfo struct {
 	MasterSince *metav1.Time `json:"masterSince,omitempty"`
 }
 
+// BackupSetStatus represents the state of a coordinated backup set.
+// +kubebuilder:validation:Enum=Running;Succeeded;Failed
+type BackupSetStatus string
+
+const (
+	// BackupSetStatusRunning indicates the backup is in progress.
+	BackupSetStatusRunning BackupSetStatus = "Running"
+	// BackupSetStatusSucceeded indicates all shards completed successfully.
+	BackupSetStatusSucceeded BackupSetStatus = "Succeeded"
+	// BackupSetStatusFailed indicates one or more shards failed.
+	BackupSetStatusFailed BackupSetStatus = "Failed"
+)
+
+// RestoreState represents the state of a coordinated restore operation.
+// +kubebuilder:validation:Enum=Pending;Restoring;Ready
+type RestoreState string
+
+const (
+	// RestoreStatePending indicates the restore has not started yet.
+	RestoreStatePending RestoreState = "Pending"
+	// RestoreStateRestoring indicates shards are actively restoring.
+	RestoreStateRestoring RestoreState = "Restoring"
+	// RestoreStateReady indicates all shards have restored from the same backup set.
+	RestoreStateReady RestoreState = "Ready"
+)
+
+// ShardBackupInfo tracks per-shard snapshot information within a backup set.
+type ShardBackupInfo struct {
+	// ShardName is the name of the shard (e.g., "shard-0").
+	ShardName string `json:"shardName"`
+	// SnapshotPath is the full path or S3 URI to the snapshot file.
+	// +optional
+	SnapshotPath string `json:"snapshotPath,omitempty"`
+	// Status indicates if this shard's backup succeeded or failed.
+	// +optional
+	Status BackupSetStatus `json:"status,omitempty"`
+	// CompletedAt is when this shard's snapshot completed.
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+}
+
+// BackupSet represents a coordinated backup across all shards.
+type BackupSet struct {
+	// ID is a unique identifier for this backup set (timestamp string, e.g., "2026-01-24T16-30-00Z").
+	ID string `json:"id"`
+	// StartedAt is when the backup set was initiated.
+	StartedAt metav1.Time `json:"startedAt"`
+	// CompletedAt is when the backup set finished (success or failure).
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+	// Status is the overall status of the backup set.
+	Status BackupSetStatus `json:"status"`
+	// Shards contains per-shard backup information.
+	// +optional
+	Shards []ShardBackupInfo `json:"shards,omitempty"`
+}
+
 type ClusterStatus struct {
 	// ConfigHash is the hash of the last applied DFLYCLUSTER CONFIG payload.
 	ConfigHash string `json:"configHash,omitempty"`
@@ -357,6 +414,21 @@ type ClusterStatus struct {
 	// Key is the shard name (e.g., "shard-0").
 	// +optional
 	ShardMasters map[string]ShardMasterInfo `json:"shardMasters,omitempty"`
+
+	// LastBackupSet contains information about the most recent coordinated backup.
+	// +optional
+	LastBackupSet *BackupSet `json:"lastBackupSet,omitempty"`
+	// ActiveRestoreSet is the backup set ID that shards should restore from.
+	// Set by the operator when a new backup set is available and pods are starting.
+	// +optional
+	ActiveRestoreSet string `json:"activeRestoreSet,omitempty"`
+	// RestoreState tracks the progress of the coordinated restore operation.
+	// +optional
+	RestoreState RestoreState `json:"restoreState,omitempty"`
+	// LastScheduledBackup is when the operator last checked/ran the cron schedule.
+	// Used to determine when the next backup should run.
+	// +optional
+	LastScheduledBackup *metav1.Time `json:"lastScheduledBackup,omitempty"`
 }
 
 //+kubebuilder:object:root=true

@@ -553,6 +553,19 @@ func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *apps
 			snapshotDir = SnapshotsDir
 		}
 
+		// For cluster mode, use shard-aware snapshot paths
+		// This ensures each shard stores snapshots in its own directory
+		isClusterMode := df.Spec.Cluster != nil && df.Spec.Cluster.Mode == resourcesv1.ClusterModeMultiShard
+		shardName := ""
+		if isClusterMode {
+			if sn, ok := statefulset.Spec.Selector.MatchLabels[ShardNameLabelKey]; ok {
+				shardName = sn
+			}
+		}
+
+		// Compute the final snapshot directory (shard-aware for cluster mode)
+		effectiveSnapshotDir := ComputeShardSnapshotDir(snapshotDir, df.Name, shardName)
+
 		if df.Spec.Snapshot.PersistentVolumeClaimSpec != nil {
 			// attach and use the PVC if specified
 			statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates, corev1.PersistentVolumeClaim{
@@ -567,9 +580,17 @@ func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *apps
 				Spec: *df.Spec.Snapshot.PersistentVolumeClaimSpec,
 			})
 
+			// For PVC mounts, mount at the base dir (snapshotDir) and let Dragonfly
+			// write to the shard-specific subdirectory via --dir arg
+			mountPath := snapshotDir
+			if isClusterMode && shardName != "" {
+				// Mount the PVC at base path, the --dir arg will point to the shard subdir
+				mountPath = snapshotDir
+			}
+
 			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
 				Name:      SnapshotsVolumeName,
-				MountPath: snapshotDir,
+				MountPath: mountPath,
 			})
 		}
 
@@ -590,9 +611,12 @@ func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *apps
 			})
 		}
 
-		container.Args = append(container.Args, fmt.Sprintf("%s=%s", SnapshotsDirArg, snapshotDir))
+		container.Args = append(container.Args, fmt.Sprintf("%s=%s", SnapshotsDirArg, effectiveSnapshotDir))
 
-		if df.Spec.Snapshot.Cron != "" {
+		// For cluster mode, do NOT set snapshot_cron on the server side.
+		// The operator will manage BGSAVE orchestration to coordinate backups across all shards.
+		// For non-cluster mode, pass the cron schedule to the server as before.
+		if df.Spec.Snapshot.Cron != "" && !isClusterMode {
 			container.Args = append(container.Args, fmt.Sprintf("%s=%s", SnapshotsCronArg, df.Spec.Snapshot.Cron))
 		}
 	}
@@ -715,6 +739,28 @@ func upsertArg(args []string, prefix, newValue string) []string {
 		}
 	}
 	return append(args, newValue)
+}
+
+// ComputeShardSnapshotDir computes the shard-aware snapshot directory path.
+// For cluster mode, it appends /<clusterName>/<shardName>/ to the base path.
+// For S3 paths (s3://bucket/path), it becomes s3://bucket/path/<cluster>/<shard>/
+// For local paths (/dragonfly/snapshots), it becomes /dragonfly/snapshots/<cluster>/<shard>/
+// If shardName is empty (non-cluster mode), returns the base path unchanged.
+func ComputeShardSnapshotDir(basePath, clusterName, shardName string) string {
+	if shardName == "" {
+		return basePath
+	}
+
+	// Handle S3 paths
+	if strings.HasPrefix(basePath, "s3://") {
+		// Ensure path ends without trailing slash for consistent joining
+		basePath = strings.TrimSuffix(basePath, "/")
+		return fmt.Sprintf("%s/%s/%s", basePath, clusterName, shardName)
+	}
+
+	// Handle local filesystem paths
+	basePath = strings.TrimSuffix(basePath, "/")
+	return fmt.Sprintf("%s/%s/%s", basePath, clusterName, shardName)
 }
 
 func upsertEnvVar(envs *[]corev1.EnvVar, name, value string) {

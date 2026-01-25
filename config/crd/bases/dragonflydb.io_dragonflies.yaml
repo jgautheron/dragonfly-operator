@@ -7090,13 +7090,84 @@ spec:
                 description: Cluster holds details about the current cluster configuration
                   state.
                 properties:
+                  activeRestoreSet:
+                    description: |-
+                      ActiveRestoreSet is the backup set ID that shards should restore from.
+                      Set by the operator when a new backup set is available and pods are starting.
+                    type: string
                   configHash:
                     description: ConfigHash is the hash of the last applied DFLYCLUSTER
                       CONFIG payload.
                     type: string
+                  lastBackupSet:
+                    description: LastBackupSet contains information about the most
+                      recent coordinated backup.
+                    properties:
+                      completedAt:
+                        description: CompletedAt is when the backup set finished (success
+                          or failure).
+                        format: date-time
+                        type: string
+                      id:
+                        description: ID is a unique identifier for this backup set
+                          (timestamp string, e.g., "2026-01-24T16-30-00Z").
+                        type: string
+                      shards:
+                        description: Shards contains per-shard backup information.
+                        items:
+                          description: ShardBackupInfo tracks per-shard snapshot information
+                            within a backup set.
+                          properties:
+                            completedAt:
+                              description: CompletedAt is when this shard's snapshot
+                                completed.
+                              format: date-time
+                              type: string
+                            shardName:
+                              description: ShardName is the name of the shard (e.g.,
+                                "shard-0").
+                              type: string
+                            snapshotPath:
+                              description: SnapshotPath is the full path or S3 URI
+                                to the snapshot file.
+                              type: string
+                            status:
+                              description: Status indicates if this shard's backup
+                                succeeded or failed.
+                              enum:
+                              - Running
+                              - Succeeded
+                              - Failed
+                              type: string
+                          required:
+                          - shardName
+                          type: object
+                        type: array
+                      startedAt:
+                        description: StartedAt is when the backup set was initiated.
+                        format: date-time
+                        type: string
+                      status:
+                        description: Status is the overall status of the backup set.
+                        enum:
+                        - Running
+                        - Succeeded
+                        - Failed
+                        type: string
+                    required:
+                    - id
+                    - startedAt
+                    - status
+                    type: object
                   lastConfigAppliedAt:
                     description: LastConfigAppliedAt indicates when the cluster config
                       was last applied.
+                    format: date-time
+                    type: string
+                  lastScheduledBackup:
+                    description: |-
+                      LastScheduledBackup is when the operator last checked/ran the cron schedule.
+                      Used to determine when the next backup should run.
                     format: date-time
                     type: string
                   observedGeneration:
@@ -7104,6 +7175,14 @@ spec:
                       the status represents.
                     format: int64
                     type: integer
+                  restoreState:
+                    description: RestoreState tracks the progress of the coordinated
+                      restore operation.
+                    enum:
+                    - Pending
+                    - Restoring
+                    - Ready
+                    type: string
                   shardMasters:
                     additionalProperties:
                       description: |-
