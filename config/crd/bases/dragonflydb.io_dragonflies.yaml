@@ -4290,12 +4290,6 @@ spec:
                       across different nodes. This helps ensure masters from different shards
                       run on different nodes for high availability. Defaults to true.
                     type: boolean
-                  mode:
-                    description: Mode selects the Dragonfly cluster mode implementation.
-                    enum:
-                    - Emulated
-                    - MultiShard
-                    type: string
                   replicasPerShard:
                     default: 1
                     description: |-
@@ -4312,7 +4306,6 @@ spec:
                     minimum: 1
                     type: integer
                 required:
-                - mode
                 - shards
                 type: object
               containerSecurityContext:

@@ -461,7 +461,7 @@ func (dfi *DragonflyInstance) adminPort() int32 {
 }
 
 func (dfi *DragonflyInstance) isClusterMode() bool {
-	return dfi.df.Spec.Cluster != nil && dfi.df.Spec.Cluster.Mode == dfv1alpha1.ClusterModeMultiShard
+	return dfi.df.Spec.Cluster != nil
 }
 
 // isTerminating returns true if the dragonfly instance is being deleted

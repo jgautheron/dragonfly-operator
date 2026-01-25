@@ -35,7 +35,7 @@ var (
 
 // GenerateDragonflyResources returns the resources required for a Dragonfly Instance.
 func GenerateDragonflyResources(df *resourcesv1.Dragonfly, defaultDragonflyImage string) ([]client.Object, error) {
-	if df.Spec.Cluster != nil && df.Spec.Cluster.Mode == resourcesv1.ClusterModeMultiShard {
+	if df.Spec.Cluster != nil {
 		return generateClusterResources(df, defaultDragonflyImage)
 	}
 	return generateStandaloneResources(df, defaultDragonflyImage)
@@ -468,7 +468,7 @@ func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *apps
 		container.Args = append(container.Args, df.Spec.Args...)
 	}
 
-	if df.Spec.Cluster != nil && df.Spec.Cluster.Mode == resourcesv1.ClusterModeMultiShard {
+	if df.Spec.Cluster != nil {
 		container.Args = append(container.Args, fmt.Sprintf("%s=yes", ClusterModeArg))
 		if df.Spec.Cluster.AdminPort != 0 {
 			container.Args = upsertArg(container.Args, "--admin_port=", fmt.Sprintf("--admin_port=%d", df.Spec.Cluster.AdminPort))
@@ -555,7 +555,7 @@ func applyStatefulSetCustomizations(df *resourcesv1.Dragonfly, statefulset *apps
 
 		// For cluster mode, use shard-aware snapshot paths
 		// This ensures each shard stores snapshots in its own directory
-		isClusterMode := df.Spec.Cluster != nil && df.Spec.Cluster.Mode == resourcesv1.ClusterModeMultiShard
+		isClusterMode := df.Spec.Cluster != nil
 		shardName := ""
 		if isClusterMode {
 			if sn, ok := statefulset.Spec.Selector.MatchLabels[ShardNameLabelKey]; ok {

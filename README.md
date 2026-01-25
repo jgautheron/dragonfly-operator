@@ -59,10 +59,11 @@ metadata:
   name: dragonfly-cluster
 spec:
   cluster:
-    mode: MultiShard
     shards: 2              # number of shards
     replicasPerShard: 2    # 1 primary + 1 replica per shard (optional, defaults to 1)
 ```
+
+When `spec.cluster` is set, the operator automatically enables Dragonfly's cluster mode (`--cluster_mode=yes`) and manages the cluster configuration.
 
 The operator automatically:
 - Creates StatefulSets named `dragonfly-cluster-shard-0`, `dragonfly-cluster-shard-1`, etc.

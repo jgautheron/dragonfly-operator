@@ -1491,7 +1491,6 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 				Spec: resourcesv1.DragonflySpec{
 					Resources: &clusterResources,
 					Cluster: &resourcesv1.ClusterSpec{
-						Mode:             resourcesv1.ClusterModeMultiShard,
 						Shards:           2,
 						ReplicasPerShard: 1,
 					},
@@ -1679,7 +1678,6 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 					Spec: resourcesv1.DragonflySpec{
 						Resources: &failoverResources,
 						Cluster: &resourcesv1.ClusterSpec{
-							Mode:             resourcesv1.ClusterModeMultiShard,
 							Shards:           2,
 							ReplicasPerShard: 2,
 						},
@@ -1877,7 +1875,6 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 					Spec: resourcesv1.DragonflySpec{
 						Resources: &hardenResources,
 						Cluster: &resourcesv1.ClusterSpec{
-							Mode:             resourcesv1.ClusterModeMultiShard,
 							Shards:           2,
 							ReplicasPerShard: 2,
 						},

@@ -182,22 +182,10 @@ type DragonflySpec struct {
 	OwnedObjectsMetadata *OwnedObjectsMetadata `json:"ownedObjectsMetadata,omitempty"`
 }
 
-// ClusterMode indicates which Dragonfly cluster mode should be used.
-type ClusterMode string
-
-const (
-	// ClusterModeEmulated uses the legacy single-master replication mode.
-	ClusterModeEmulated ClusterMode = "Emulated"
-	// ClusterModeMultiShard provisions Dragonfly in real multi-shard cluster mode.
-	ClusterModeMultiShard ClusterMode = "MultiShard"
-)
-
-// ClusterSpec describes the desired real cluster topology.
+// ClusterSpec describes the desired cluster topology.
+// When spec.cluster is set, the operator automatically enables Dragonfly's
+// cluster mode (--cluster_mode=yes) and manages the cluster configuration.
 type ClusterSpec struct {
-	// Mode selects the Dragonfly cluster mode implementation.
-	// +kubebuilder:validation:Enum=Emulated;MultiShard
-	Mode ClusterMode `json:"mode"`
-
 	// AdminPort overrides the admin port used for cluster commands.
 	// Defaults to 9999 when unset.
 	// +optional
