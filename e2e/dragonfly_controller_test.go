@@ -33,6 +33,8 @@ import (
 	"github.com/dragonflydb/dragonfly-operator/internal/resources"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -150,7 +152,25 @@ var _ = Describe("Dragonfly Lifecycle tests", Ordered, FlakeAttempts(3), func() 
 		})
 
 		It("Should create successfully", func() {
-			err := k8sClient.Create(ctx, &df)
+			var existingDf resourcesv1.Dragonfly
+			err := k8sClient.Get(ctx, types.NamespacedName{
+				Name:      name,
+				Namespace: namespace,
+			}, &existingDf)
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, &existingDf)).To(Succeed())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      name,
+						Namespace: namespace,
+					}, &existingDf)
+					return apierrors.IsNotFound(err)
+				}, 2*time.Minute, 2*time.Second).Should(BeTrue(), "dragonfly should be deleted before creation")
+			} else if !apierrors.IsNotFound(err) {
+				Expect(err).To(BeNil(), "failed to check existing dragonfly")
+			}
+
+			err = k8sClient.Create(ctx, &df)
 			Expect(err).To(BeNil())
 
 			// Wait until Dragonfly object is marked initialized
@@ -1698,35 +1718,78 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 			})
 
 			It("promotes replica to master when shard master is deleted", func() {
-				// Find the master pod of shard-0
-				var shardPods corev1.PodList
-				err := k8sClient.List(ctx, &shardPods, client.InNamespace(namespace), client.MatchingLabels{
-					resources.DragonflyNameLabelKey: failoverClusterName,
-					resources.ShardNameLabelKey:     "shard-0",
-				})
-				Expect(err).To(BeNil())
-				Expect(shardPods.Items).To(HaveLen(2))
-
-				var masterPod *corev1.Pod
-				var replicaPod *corev1.Pod
-				for i := range shardPods.Items {
-					if shardPods.Items[i].Labels[resources.RoleLabelKey] == resources.Master {
-						masterPod = &shardPods.Items[i]
-					} else {
-						replicaPod = &shardPods.Items[i]
+				isPodReady := func(pod *corev1.Pod) bool {
+					if pod.Status.Phase != corev1.PodRunning {
+						return false
 					}
+					for _, condition := range pod.Status.Conditions {
+						if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+							return true
+						}
+					}
+					return false
 				}
-				Expect(masterPod).NotTo(BeNil(), "should have a master pod")
-				Expect(replicaPod).NotTo(BeNil(), "should have a replica pod")
 
-				originalMasterName := masterPod.Name
-				replicaName := replicaPod.Name
+				var originalMasterName string
+				var replicaName string
+				Eventually(func() error {
+					var shardPods corev1.PodList
+					err := k8sClient.List(ctx, &shardPods, client.InNamespace(namespace), client.MatchingLabels{
+						resources.DragonflyNameLabelKey: failoverClusterName,
+						resources.ShardNameLabelKey:     "shard-0",
+					})
+					if err != nil {
+						return err
+					}
+					if len(shardPods.Items) != 2 {
+						return fmt.Errorf("expected 2 shard-0 pods, got %d", len(shardPods.Items))
+					}
+
+					originalMasterName = ""
+					replicaName = ""
+					for i := range shardPods.Items {
+						role := shardPods.Items[i].Labels[resources.RoleLabelKey]
+						if role == "" {
+							return fmt.Errorf("pod %s role label not set", shardPods.Items[i].Name)
+						}
+						if role == resources.Master {
+							originalMasterName = shardPods.Items[i].Name
+						} else if role == resources.Replica {
+							replicaName = shardPods.Items[i].Name
+						}
+					}
+					if originalMasterName == "" || replicaName == "" {
+						return fmt.Errorf("master/replica roles not assigned yet")
+					}
+					return nil
+				}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
 				// Delete the master pod
-				err = k8sClient.Delete(ctx, masterPod)
+				var masterPod corev1.Pod
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      originalMasterName,
+					Namespace: namespace,
+				}, &masterPod)
+				Expect(err).To(BeNil())
+				originalMasterUID := masterPod.UID
+
+				err = k8sClient.Delete(ctx, &masterPod)
 				Expect(err).To(BeNil())
 
-				// Wait for the replica to be promoted to master
+				// Wait for the original master pod to be recreated (UID changes)
+				Eventually(func() bool {
+					var pod corev1.Pod
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      originalMasterName,
+						Namespace: namespace,
+					}, &pod)
+					if err != nil {
+						return false
+					}
+					return pod.UID != originalMasterUID
+				}, 2*time.Minute, 5*time.Second).Should(BeTrue(), "master pod should be recreated")
+
+				// Wait for the replica to be promoted to master and become ready
 				Eventually(func() (string, error) {
 					var pod corev1.Pod
 					err := k8sClient.Get(ctx, types.NamespacedName{
@@ -1736,8 +1799,11 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 					if err != nil {
 						return "", err
 					}
+					if !isPodReady(&pod) {
+						return "", fmt.Errorf("replica pod not ready yet")
+					}
 					return pod.Labels[resources.RoleLabelKey], nil
-				}, 3*time.Minute, 5*time.Second).Should(Equal(resources.Master), "replica should be promoted to master")
+				}, 5*time.Minute, 5*time.Second).Should(Equal(resources.Master), "replica should be promoted to master")
 
 				// Wait for the original master pod to be recreated and become a replica
 				Eventually(func() (string, error) {
@@ -1749,12 +1815,11 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 					if err != nil {
 						return "", err
 					}
-					// Check if pod is ready
-					if pod.Status.Phase != corev1.PodRunning {
-						return "", fmt.Errorf("pod not running yet")
+					if !isPodReady(&pod) {
+						return "", fmt.Errorf("pod not ready yet")
 					}
 					return pod.Labels[resources.RoleLabelKey], nil
-				}, 3*time.Minute, 5*time.Second).Should(Equal(resources.Replica), "recreated pod should become replica")
+				}, 5*time.Minute, 5*time.Second).Should(Equal(resources.Replica), "recreated pod should become replica")
 
 				// Verify cluster is still operational
 				err = waitForDragonflyPhase(ctx, k8sClient, failoverClusterName, namespace, controller.PhaseReady, 2*time.Minute)
@@ -2159,6 +2224,285 @@ var _ = Describe("Dragonfly Dataset Loading Readiness Gate", Ordered, FlakeAttem
 				Eventually(func() bool {
 					err := k8sClient.Get(ctx, types.NamespacedName{
 						Name:      hardenClusterName,
+						Namespace: namespace,
+					}, &df)
+					return apierrors.IsNotFound(err)
+				}, 2*time.Minute, 2*time.Second).Should(BeTrue())
+			})
+		})
+
+		Context("Multi-shard cluster scaling", Ordered, func() {
+			scalingClusterName := "df-cluster-scaling"
+			scalingResources := corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("200m"),
+					corev1.ResourceMemory: resource.MustParse("400Mi"),
+				},
+			}
+
+			It("creates a cluster with 2 shards for scaling testing", func() {
+				scalingSpec := resourcesv1.Dragonfly{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      scalingClusterName,
+						Namespace: namespace,
+					},
+					Spec: resourcesv1.DragonflySpec{
+						Resources: &scalingResources,
+						Cluster: &resourcesv1.ClusterSpec{
+							Shards:           2,
+							ReplicasPerShard: 1,
+						},
+					},
+				}
+				err := k8sClient.Create(ctx, scalingSpec.DeepCopy())
+				Expect(err).To(BeNil())
+
+				// Wait for all statefulsets to be ready
+				for i := int32(0); i < scalingSpec.Spec.Cluster.Shards; i++ {
+					stsName := fmt.Sprintf("%s-shard-%d", scalingClusterName, i)
+					err := waitForStatefulSetReady(ctx, k8sClient, stsName, namespace, 5*time.Minute)
+					Expect(err).To(BeNil(), "statefulset %s should be ready", stsName)
+				}
+
+				err = waitForDragonflyPhase(ctx, k8sClient, scalingClusterName, namespace, controller.PhaseReady, 5*time.Minute)
+				Expect(err).To(BeNil())
+
+				// Verify initial slot distribution (2 shards: 0-8191, 8192-16383)
+				var pods corev1.PodList
+				err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: scalingClusterName,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).To(HaveLen(2))
+
+				Eventually(func() ([]slotRange, error) {
+					return getClusterSlotRanges(ctx, clientset, cfg, &pods.Items[0], resources.DragonflyAdminPort)
+				}, 2*time.Minute, 5*time.Second).Should(WithTransform(func(ranges []slotRange) string {
+					if len(ranges) < 2 {
+						return fmt.Sprintf("len:%d", len(ranges))
+					}
+					return fmt.Sprintf("%d:%d,%d:%d", ranges[0].Start, ranges[0].End, ranges[1].Start, ranges[1].End)
+				}, Equal("0:8191,8192:16383")))
+			})
+
+		It("inserts test data before scaling", func() {
+			// Insert test data using hash tags to keep all keys on the same shard
+			// This avoids MOVED redirects when using a non-cluster-aware client
+			stopChan := make(chan struct{}, 1)
+			rc, err := checkAndK8sPortForwardRedis(ctx, clientset, cfg, stopChan, scalingClusterName, namespace, "", 6399)
+			Expect(err).To(BeNil())
+			defer close(stopChan)
+			defer rc.Close()
+
+			// Use hash tags {scaling} to ensure all keys hash to the same slot
+			// This allows testing with a non-cluster-aware client
+			for i := 0; i < 100; i++ {
+				key := fmt.Sprintf("{scaling}test-key-%d", i)
+				err := rc.Set(ctx, key, fmt.Sprintf("value-%d", i), 0).Err()
+				Expect(err).To(BeNil())
+			}
+		})
+
+			It("scales up cluster from 2 to 4 shards", func() {
+				// Update the cluster to 4 shards
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      scalingClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+
+				df.Spec.Cluster.Shards = 4
+				err = k8sClient.Update(ctx, &df)
+				Expect(err).To(BeNil())
+
+				// Wait for new shard statefulsets to be created and ready
+				for i := int32(0); i < 4; i++ {
+					stsName := fmt.Sprintf("%s-shard-%d", scalingClusterName, i)
+					err := waitForStatefulSetReady(ctx, k8sClient, stsName, namespace, 5*time.Minute)
+					Expect(err).To(BeNil(), "statefulset %s should be ready", stsName)
+				}
+
+				// Wait for cluster to be ready (migrations may take time)
+				err = waitForDragonflyPhase(ctx, k8sClient, scalingClusterName, namespace, controller.PhaseReady, 10*time.Minute)
+				Expect(err).To(BeNil())
+
+				// Verify 4 pods exist
+				var pods corev1.PodList
+				err = k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+					resources.DragonflyNameLabelKey: scalingClusterName,
+				})
+				Expect(err).To(BeNil())
+				Expect(pods.Items).To(HaveLen(4))
+
+				// Verify PreviousShards is updated
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      scalingClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+				Expect(df.Status.Cluster).NotTo(BeNil())
+				Expect(df.Status.Cluster.PreviousShards).To(Equal(int32(4)))
+
+				// Verify new slot distribution (4 shards)
+				Eventually(func() ([]slotRange, error) {
+					return getClusterSlotRanges(ctx, clientset, cfg, &pods.Items[0], resources.DragonflyAdminPort)
+				}, 2*time.Minute, 5*time.Second).Should(WithTransform(func(ranges []slotRange) int {
+					return len(ranges)
+				}, Equal(4)))
+			})
+
+		It("verifies data is still accessible after scale-up", func() {
+		// Verify test data is still accessible by connecting to the correct shard owner.
+		var pods corev1.PodList
+		err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+			resources.DragonflyNameLabelKey: scalingClusterName,
+		})
+		Expect(err).To(BeNil())
+		Expect(pods.Items).NotTo(BeEmpty())
+
+		slot, err := computeKeySlot("{scaling}test-key-0")
+		Expect(err).To(BeNil())
+
+		owners, err := getClusterSlotOwners(ctx, clientset, cfg, &pods.Items[0], resources.DragonflyAdminPort)
+		Expect(err).To(BeNil())
+
+		ownerPod, err := findMasterPodForSlot(slot, owners, pods.Items)
+		Expect(err).To(BeNil())
+
+		pfResult, err := setupPortForwardWithCleanup(ctx, clientset, cfg, ownerPod, resources.DragonflyPort, 10*time.Second)
+		Expect(err).To(BeNil())
+		defer pfResult.Cleanup()
+
+		rc := redis.NewClient(&redis.Options{
+			Addr: fmt.Sprintf("localhost:%d", pfResult.LocalPort),
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode: maintnotifications.ModeDisabled,
+			},
+		})
+		defer rc.Close()
+
+		// Check that our test keys are still accessible (using same hash tag)
+		for i := 0; i < 100; i++ {
+			key := fmt.Sprintf("{scaling}test-key-%d", i)
+			val, err := rc.Get(ctx, key).Result()
+			Expect(err).To(BeNil(), "key %s should be accessible after scale-up", key)
+			Expect(val).To(Equal(fmt.Sprintf("value-%d", i)))
+		}
+		})
+
+			It("scales down cluster from 4 to 2 shards", func() {
+				// Update the cluster back to 2 shards
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      scalingClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+
+				df.Spec.Cluster.Shards = 2
+				err = k8sClient.Update(ctx, &df)
+				Expect(err).To(BeNil())
+
+				// Wait for cluster to be ready (draining and cleanup may take time)
+				err = waitForDragonflyPhase(ctx, k8sClient, scalingClusterName, namespace, controller.PhaseReady, 10*time.Minute)
+				Expect(err).To(BeNil())
+
+				// Verify only 2 pods exist (shard-2 and shard-3 should be deleted)
+				Eventually(func() int {
+					var pods corev1.PodList
+					err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+						resources.DragonflyNameLabelKey: scalingClusterName,
+					})
+					if err != nil {
+						return -1
+					}
+					return len(pods.Items)
+				}, 5*time.Minute, 5*time.Second).Should(Equal(2))
+
+				// Verify PreviousShards is updated
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      scalingClusterName,
+					Namespace: namespace,
+				}, &df)
+				Expect(err).To(BeNil())
+				Expect(df.Status.Cluster).NotTo(BeNil())
+				Expect(df.Status.Cluster.PreviousShards).To(Equal(int32(2)))
+				Expect(df.Status.Cluster.ScaleDownPending).To(BeEmpty())
+
+				// Verify statefulsets for removed shards are deleted
+				var sts appsv1.StatefulSet
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      fmt.Sprintf("%s-shard-2", scalingClusterName),
+					Namespace: namespace,
+				}, &sts)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue(), "shard-2 statefulset should be deleted")
+
+				err = k8sClient.Get(ctx, types.NamespacedName{
+					Name:      fmt.Sprintf("%s-shard-3", scalingClusterName),
+					Namespace: namespace,
+				}, &sts)
+				Expect(apierrors.IsNotFound(err)).To(BeTrue(), "shard-3 statefulset should be deleted")
+			})
+
+		It("verifies data is still accessible after scale-down", func() {
+		// Verify test data is still accessible after scale-down by connecting to the correct shard owner.
+		var pods corev1.PodList
+		err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{
+			resources.DragonflyNameLabelKey: scalingClusterName,
+		})
+		Expect(err).To(BeNil())
+		Expect(pods.Items).NotTo(BeEmpty())
+
+		slot, err := computeKeySlot("{scaling}test-key-0")
+		Expect(err).To(BeNil())
+
+		owners, err := getClusterSlotOwners(ctx, clientset, cfg, &pods.Items[0], resources.DragonflyAdminPort)
+		Expect(err).To(BeNil())
+
+		ownerPod, err := findMasterPodForSlot(slot, owners, pods.Items)
+		Expect(err).To(BeNil())
+
+		pfResult, err := setupPortForwardWithCleanup(ctx, clientset, cfg, ownerPod, resources.DragonflyPort, 10*time.Second)
+		Expect(err).To(BeNil())
+		defer pfResult.Cleanup()
+
+		rc := redis.NewClient(&redis.Options{
+			Addr: fmt.Sprintf("localhost:%d", pfResult.LocalPort),
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode: maintnotifications.ModeDisabled,
+			},
+		})
+		defer rc.Close()
+
+		// Check that our test keys are still accessible (using same hash tag)
+		for i := 0; i < 100; i++ {
+			key := fmt.Sprintf("{scaling}test-key-%d", i)
+			val, err := rc.Get(ctx, key).Result()
+			Expect(err).To(BeNil(), "key %s should be accessible after scale-down", key)
+			Expect(val).To(Equal(fmt.Sprintf("value-%d", i)))
+		}
+		})
+
+			AfterAll(func() {
+				var df resourcesv1.Dragonfly
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      scalingClusterName,
+					Namespace: namespace,
+				}, &df)
+				if apierrors.IsNotFound(err) {
+					return
+				}
+				Expect(err).To(BeNil())
+				err = k8sClient.Delete(ctx, &df)
+				Expect(err).To(BeNil())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{
+						Name:      scalingClusterName,
 						Namespace: namespace,
 					}, &df)
 					return apierrors.IsNotFound(err)

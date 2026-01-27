@@ -7083,6 +7083,58 @@ spec:
                 description: Cluster holds details about the current cluster configuration
                   state.
                 properties:
+                  activeMigrations:
+                    description: ActiveMigrations tracks in-progress slot migrations
+                      during scaling.
+                    items:
+                      description: SlotMigration tracks an in-progress slot migration
+                        between shards.
+                      properties:
+                        slotRanges:
+                          description: SlotRanges being migrated.
+                          items:
+                            description: |-
+                              SlotRange describes a hash slot interval owned by a shard (used internally).
+                              Both Start and End are inclusive (e.g., Start=0, End=8191 covers 8192 slots).
+                            properties:
+                              end:
+                                format: int32
+                                type: integer
+                              start:
+                                format: int32
+                                type: integer
+                            required:
+                            - end
+                            - start
+                            type: object
+                          type: array
+                        sourceShard:
+                          description: SourceShard is the shard slots are moving from
+                            (e.g., "shard-0").
+                          type: string
+                        startedAt:
+                          description: StartedAt is when the migration began.
+                          format: date-time
+                          type: string
+                        status:
+                          description: Status indicates the current state of this
+                            migration.
+                          enum:
+                          - Pending
+                          - Syncing
+                          - Finished
+                          - Failed
+                          type: string
+                        targetShard:
+                          description: TargetShard is the shard slots are moving to
+                            (e.g., "shard-2").
+                          type: string
+                      required:
+                      - slotRanges
+                      - sourceShard
+                      - targetShard
+                      type: object
+                    type: array
                   activeRestoreSet:
                     description: |-
                       ActiveRestoreSet is the backup set ID that shards should restore from.
@@ -7168,6 +7220,11 @@ spec:
                       the status represents.
                     format: int64
                     type: integer
+                  previousShards:
+                    description: PreviousShards tracks the last known shard count
+                      for detecting scaling operations.
+                    format: int32
+                    type: integer
                   restoreState:
                     description: RestoreState tracks the progress of the coordinated
                       restore operation.
@@ -7176,6 +7233,13 @@ spec:
                     - Restoring
                     - Ready
                     type: string
+                  scaleDownPending:
+                    description: |-
+                      ScaleDownPending lists shards pending deletion after draining slots.
+                      These shards still exist but are being drained of data.
+                    items:
+                      type: string
+                    type: array
                   shardMasters:
                     additionalProperties:
                       description: |-

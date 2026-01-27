@@ -1185,9 +1185,34 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 		replicasPerShard = 1
 	}
 
+	// Initialize PreviousShards on first run or when cluster status doesn't exist
+	if dfi.df.Status.Cluster == nil || dfi.df.Status.Cluster.PreviousShards == 0 {
+		// First-time setup: initialize previousShards to current spec
+		patchFrom := client.MergeFrom(dfi.df.DeepCopy())
+		if dfi.df.Status.Cluster == nil {
+			dfi.df.Status.Cluster = &dfv1alpha1.ClusterStatus{}
+		}
+		dfi.df.Status.Cluster.PreviousShards = dfi.df.Spec.Cluster.Shards
+		if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to initialize previousShards: %w", err)
+		}
+		dfi.log.Info("initialized previousShards", "shards", dfi.df.Spec.Cluster.Shards)
+	}
+
+	// Determine effective shard count (includes scale-down pending shards)
+	effectiveShards := dfi.df.Spec.Cluster.Shards
+	if dfi.df.Status.Cluster != nil {
+		if dfi.df.Status.Cluster.PreviousShards > effectiveShards {
+			effectiveShards = dfi.df.Status.Cluster.PreviousShards
+		}
+		if len(dfi.df.Status.Cluster.ScaleDownPending) > 0 {
+			effectiveShards = dfi.df.Status.Cluster.PreviousShards
+		}
+	}
+
 	// Check if we need to handle failover (some pods are missing, unhealthy, or split-brain)
 	needsFailover := false
-	for i := int32(0); i < dfi.df.Spec.Cluster.Shards; i++ {
+	for i := int32(0); i < effectiveShards; i++ {
 		shardName := fmt.Sprintf("shard-%d", i)
 		pods := shardPods[shardName]
 
@@ -1219,7 +1244,7 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 
 	// If no failover needed, wait for all pods to be ready before proceeding
 	if !needsFailover {
-		for i := int32(0); i < dfi.df.Spec.Cluster.Shards; i++ {
+		for i := int32(0); i < effectiveShards; i++ {
 			shardName := fmt.Sprintf("shard-%d", i)
 			if int32(len(shardPods[shardName])) != replicasPerShard {
 				dfi.log.Info("shard has unexpected replica count, waiting", "shard", shardName, "expected", replicasPerShard, "actual", len(shardPods[shardName]))
@@ -1248,7 +1273,7 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 	readyShardPods := make(map[string][]*corev1.Pod)
 	var readyAllPods []*corev1.Pod
 
-	for i := int32(0); i < dfi.df.Spec.Cluster.Shards; i++ {
+	for i := int32(0); i < effectiveShards; i++ {
 		shardName := fmt.Sprintf("shard-%d", i)
 		pods := shardPods[shardName]
 
@@ -1276,6 +1301,15 @@ func (dfi *DragonflyInstance) reconcileCluster(ctx context.Context) (ctrl.Result
 			return ctrl.Result{}, err
 		}
 		masters[shardName] = master
+	}
+
+	// Handle slot migration for scaling operations
+	result, handled, err := dfi.reconcileSlotMigration(ctx, masters, readyShardPods, readyAllPods)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile slot migration: %w", err)
+	}
+	if handled {
+		return result, nil
 	}
 
 	configJSON, hash, err := dfi.buildClusterConfig(ctx, masters, readyShardPods)
@@ -1767,10 +1801,22 @@ func (dfi *DragonflyInstance) selectBestReplicaCandidate(ctx context.Context, po
 	return nil
 }
 
+// clusterMigrationTarget specifies where slots should migrate to.
+// This is used in the DFLYCLUSTER CONFIG payload to trigger slot migration.
+type clusterMigrationTarget struct {
+	SlotRanges []dfv1alpha1.SlotRange `json:"slot_ranges"`
+	NodeID     string                 `json:"node_id"`
+	IP         string                 `json:"ip"`
+	Port       int                    `json:"port"`
+}
+
 type clusterNodeAddress struct {
 	SlotRanges []dfv1alpha1.SlotRange `json:"slot_ranges"`
 	Master     *clusterNode           `json:"master"`
 	Replicas   []clusterNode          `json:"replicas"`
+	// Migrations specifies slots to migrate OUT from this node.
+	// When set, Dragonfly will initiate slot transfer to the specified targets.
+	Migrations []clusterMigrationTarget `json:"migrations,omitempty"`
 }
 
 type clusterNode struct {
@@ -1954,4 +2000,762 @@ func (dfi *DragonflyInstance) getClusterNodeInfo(ctx context.Context, pod *corev
 		IP:   podIP,
 		Port: resources.DragonflyPort,
 	}, nil
+}
+
+// detectScaleChange compares spec.cluster.shards with status.cluster.previousShards
+// to detect if scaling is needed. Returns the scale direction and delta.
+func (dfi *DragonflyInstance) detectScaleChange() (scaleUp bool, scaleDown bool, delta int32) {
+	if dfi.df.Spec.Cluster == nil {
+		return false, false, 0
+	}
+
+	specShards := dfi.df.Spec.Cluster.Shards
+	previousShards := int32(0)
+
+	if dfi.df.Status.Cluster != nil && dfi.df.Status.Cluster.PreviousShards > 0 {
+		previousShards = dfi.df.Status.Cluster.PreviousShards
+	}
+
+	// If previousShards is 0, this is likely initial deployment - no scaling needed
+	if previousShards == 0 {
+		return false, false, 0
+	}
+
+	if specShards > previousShards {
+		return true, false, specShards - previousShards
+	}
+	if specShards < previousShards {
+		return false, true, previousShards - specShards
+	}
+	return false, false, 0
+}
+
+// MigrationPlan represents a computed slot migration plan.
+type MigrationPlan struct {
+	// Migrations is a list of slot migrations to perform.
+	Migrations []dfv1alpha1.SlotMigration
+	// IsScaleUp indicates if this is a scale-up operation.
+	IsScaleUp bool
+	// IsScaleDown indicates if this is a scale-down operation.
+	IsScaleDown bool
+}
+
+// computeMigrationPlan calculates which slots need to move between which shards
+// when scaling from previousShards to targetShards.
+// For scale-up: slots are redistributed from existing shards to ALL shards (including existing ones).
+// For scale-down: slots from removed shards are redistributed to remaining shards.
+func computeMigrationPlan(previousShards, targetShards int32) MigrationPlan {
+	plan := MigrationPlan{}
+
+	if previousShards == targetShards || previousShards == 0 {
+		return plan
+	}
+
+	// Compute current slot distribution (before scaling)
+	currentSlots := computeSlotRanges(previousShards)
+	// Compute target slot distribution (after scaling)
+	targetSlots := computeSlotRanges(targetShards)
+
+	if targetShards > previousShards {
+		plan.IsScaleUp = true
+	} else if targetShards < previousShards {
+		plan.IsScaleDown = true
+	}
+
+	// For each current shard, check which slots it currently owns
+	// that need to move to a different shard in the target distribution.
+	for i := int32(0); i < previousShards; i++ {
+		sourceShard := fmt.Sprintf("shard-%d", i)
+		currentRange := currentSlots[sourceShard][0]
+
+		// Check against ALL target shards to see if any need slots from this source
+		for j := int32(0); j < targetShards; j++ {
+			if i == j {
+				// Skip self - no migration needed to the same shard
+				continue
+			}
+
+			targetShard := fmt.Sprintf("shard-%d", j)
+			targetShardRange := targetSlots[targetShard][0]
+
+			// Check if this source currently owns slots that the target should own
+			if targetShardRange.Start > currentRange.End || targetShardRange.End < currentRange.Start {
+				continue
+			}
+
+			// Calculate the overlap - these are slots source has that target needs
+			migrateStart := targetShardRange.Start
+			migrateEnd := targetShardRange.End
+
+			// Clamp to what source actually owns
+			if migrateStart < currentRange.Start {
+				migrateStart = currentRange.Start
+			}
+			if migrateEnd > currentRange.End {
+				migrateEnd = currentRange.End
+			}
+
+			if migrateStart <= migrateEnd {
+				plan.Migrations = append(plan.Migrations, dfv1alpha1.SlotMigration{
+					SourceShard: sourceShard,
+					TargetShard: targetShard,
+					SlotRanges:  []dfv1alpha1.SlotRange{{Start: migrateStart, End: migrateEnd}},
+					Status:      dfv1alpha1.MigrationStatePending,
+				})
+			}
+		}
+	}
+
+	return plan
+}
+
+func validateScaleDownMasters(masters map[string]*corev1.Pod, previousShards, targetShards int32) error {
+	if targetShards >= previousShards {
+		return nil
+	}
+	for i := targetShards; i < previousShards; i++ {
+		shardName := fmt.Sprintf("shard-%d", i)
+		if masters[shardName] == nil {
+			return fmt.Errorf("missing master for draining shard %s", shardName)
+		}
+	}
+	return nil
+}
+
+// buildClusterConfigWithMigrations builds a cluster config JSON payload that includes
+// migration directives to trigger slot transfers between nodes.
+func (dfi *DragonflyInstance) buildClusterConfigWithMigrations(
+	ctx context.Context,
+	masters map[string]*corev1.Pod,
+	shardPods map[string][]*corev1.Pod,
+	migrations []dfv1alpha1.SlotMigration,
+	targetShards int32,
+) (string, string, error) {
+	var nodes []clusterNodeAddress
+
+	// Build a map of target shard -> master node info for migration targets
+	targetNodes := make(map[string]clusterNode)
+	for shardName, master := range masters {
+		if master != nil {
+			nodeInfo, err := dfi.getClusterNodeInfo(ctx, master)
+			if err != nil {
+				dfi.log.Info("failed to get node info for migration target", "shard", shardName, "err", err)
+				continue
+			}
+			targetNodes[shardName] = nodeInfo
+		}
+	}
+
+	// Build migration lookup: source shard -> list of migration targets
+	migrationsBySource := make(map[string][]clusterMigrationTarget)
+	for _, mig := range migrations {
+		if mig.Status != dfv1alpha1.MigrationStatePending && mig.Status != dfv1alpha1.MigrationStateSyncing {
+			continue // Skip finished or failed migrations
+		}
+		targetNode, ok := targetNodes[mig.TargetShard]
+		if !ok {
+			dfi.log.Info("migration target shard not found", "targetShard", mig.TargetShard)
+			continue
+		}
+		migrationsBySource[mig.SourceShard] = append(migrationsBySource[mig.SourceShard], clusterMigrationTarget{
+			SlotRanges: mig.SlotRanges,
+			NodeID:     targetNode.ID,
+			IP:         targetNode.IP,
+			Port:       resources.DragonflyPort, // Must use data port, not admin port
+		})
+	}
+
+	// Compute current slot ranges (use max of current and target to include all shards)
+	currentShards := dfi.df.Status.Cluster.PreviousShards
+	if currentShards == 0 {
+		currentShards = dfi.df.Spec.Cluster.Shards
+	}
+	maxShards := currentShards
+	if targetShards > maxShards {
+		maxShards = targetShards
+	}
+	slotRanges := computeSlotRanges(currentShards)
+
+	for i := int32(0); i < maxShards; i++ {
+		shardName := fmt.Sprintf("shard-%d", i)
+		master := masters[shardName]
+		if master == nil {
+			if i < currentShards {
+				return "", "", fmt.Errorf("shard %s has no master", shardName)
+			}
+			// For new shards during scale-up, they start with empty slot ranges
+			if i >= currentShards {
+				// New shard - include in config but with empty slots (will receive via migration)
+				if masterPod, exists := masters[shardName]; exists && masterPod != nil {
+					masterNode, err := dfi.getClusterNodeInfo(ctx, masterPod)
+					if err != nil {
+						return "", "", fmt.Errorf("failed to fetch master id for new shard %s: %w", shardName, err)
+					}
+					nodes = append(nodes, clusterNodeAddress{
+						SlotRanges: []dfv1alpha1.SlotRange{}, // Empty - will receive slots via migration
+						Master:     &masterNode,
+						Replicas:   []clusterNode{},
+					})
+				}
+			}
+			continue
+		}
+
+		masterNode, err := dfi.getClusterNodeInfo(ctx, master)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to fetch master id for shard %s: %w", shardName, err)
+		}
+
+		replicas := []clusterNode{}
+		for _, pod := range shardPods[shardName] {
+			if pod.Name == master.Name {
+				continue
+			}
+			node, err := dfi.getClusterNodeInfo(ctx, pod)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to fetch replica id for shard %s: %w", shardName, err)
+			}
+			replicas = append(replicas, node)
+		}
+
+		ranges := slotRanges[shardName]
+		if ranges == nil {
+			ranges = []dfv1alpha1.SlotRange{}
+		}
+
+		nodeAddr := clusterNodeAddress{
+			SlotRanges: ranges,
+			Master:     &masterNode,
+			Replicas:   replicas,
+		}
+
+		// Add migrations if this shard is a source
+		if migs, ok := migrationsBySource[shardName]; ok {
+			nodeAddr.Migrations = migs
+		}
+
+		nodes = append(nodes, nodeAddr)
+	}
+
+	payload, err := json.Marshal(nodes)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to marshal cluster config with migrations: %w", err)
+	}
+
+	hash := sha256.Sum256(payload)
+	dfi.log.Info("generated cluster config with migrations", "config", string(payload))
+	return string(payload), hex.EncodeToString(hash[:]), nil
+}
+
+// checkMigrationStatus queries DFLYCLUSTER SLOT-MIGRATION-STATUS on a pod to get
+// the current status of active migrations.
+// The response is an array of status strings, one per migration.
+func (dfi *DragonflyInstance) checkMigrationStatus(ctx context.Context, pod *corev1.Pod) (string, error) {
+	podIP := pod.Status.PodIP
+	var status string
+
+	err := retryWithBackoff(ctx, 2, 500*time.Millisecond, func() error {
+		client := redis.NewClient(&redis.Options{
+			ClientName: resources.DragonflyOperatorName,
+			Addr:       net.JoinHostPort(podIP, strconv.Itoa(int(dfi.adminPort()))),
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode: maintnotifications.ModeDisabled,
+			},
+		})
+		defer client.Close()
+
+		result, err := client.Do(ctx, "DFLYCLUSTER", "SLOT-MIGRATION-STATUS").Result()
+		if err != nil {
+			dfi.log.Info("retrying DFLYCLUSTER SLOT-MIGRATION-STATUS", "pod", pod.Name, "err", err)
+			return err
+		}
+
+		status = parseMigrationStatus(result)
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get migration status after retries: %w", err)
+	}
+
+	return status, nil
+}
+
+func parseMigrationStatus(result interface{}) string {
+	if result == nil {
+		return ""
+	}
+
+	switch v := result.(type) {
+	case []interface{}:
+		if len(v) == 0 {
+			return ""
+		}
+		statuses := make([]string, 0, len(v))
+		for _, item := range v {
+			switch t := item.(type) {
+			case string:
+				statuses = append(statuses, t)
+			case []byte:
+				statuses = append(statuses, string(t))
+			case fmt.Stringer:
+				statuses = append(statuses, t.String())
+			default:
+				statuses = append(statuses, fmt.Sprintf("%v", item))
+			}
+		}
+		return strings.Join(statuses, "; ")
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	case fmt.Stringer:
+		return v.String()
+	default:
+		return fmt.Sprintf("%v", result)
+	}
+}
+
+// checkAllMigrationsFinished checks if all active migrations have completed.
+// It queries the migration status on TARGET shards (the ones receiving slots).
+// According to Dragonfly's design, SLOT-MIGRATION-STATUS is queried on the target node.
+func (dfi *DragonflyInstance) checkAllMigrationsFinished(ctx context.Context, masters map[string]*corev1.Pod) (bool, error) {
+	if dfi.df.Status.Cluster == nil || len(dfi.df.Status.Cluster.ActiveMigrations) == 0 {
+		return true, nil
+	}
+
+	// Get unique target shards - we check migration status on the TARGET nodes
+	targetShards := make(map[string]bool)
+	for _, mig := range dfi.df.Status.Cluster.ActiveMigrations {
+		if mig.Status == dfv1alpha1.MigrationStateSyncing || mig.Status == dfv1alpha1.MigrationStatePending {
+			targetShards[mig.TargetShard] = true
+		}
+	}
+
+	for shardName := range targetShards {
+		master := masters[shardName]
+		if master == nil {
+			dfi.log.Info("target shard master not found for migration check", "shard", shardName)
+			// For scale-up, target might be a new shard that just came up
+			return false, nil // Not finished yet
+		}
+
+		status, err := dfi.checkMigrationStatus(ctx, master)
+		if err != nil {
+			dfi.log.Info("failed to check migration status on target", "shard", shardName, "err", err)
+			return false, nil // Assume not finished if we can't check
+		}
+
+		dfi.log.Info("migration status on target", "shard", shardName, "status", status)
+
+		// Parse the status - we check the TARGET node
+		// If status is empty or contains NO_MIGRATIONS, the migration hasn't started on this target
+		// If it contains FINISHED, this target's migration is complete
+		// Otherwise, migration is still in progress
+		if status == "" {
+			// No status means migration hasn't started yet - not finished
+			return false, nil
+		}
+		if strings.Contains(status, "FATAL") {
+			dfi.log.Error(nil, "migration failed on target", "shard", shardName, "status", status)
+			return false, fmt.Errorf("migration failed on target %s: %s", shardName, status)
+		}
+		if !strings.Contains(status, "FINISHED") {
+			// Migration in progress
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// updateMigrationStatuses updates the status of active migrations based on the
+// current migration status from Dragonfly TARGET nodes.
+func (dfi *DragonflyInstance) updateMigrationStatuses(ctx context.Context, masters map[string]*corev1.Pod) error {
+	if dfi.df.Status.Cluster == nil || len(dfi.df.Status.Cluster.ActiveMigrations) == 0 {
+		return nil
+	}
+
+	patchFrom := client.MergeFrom(dfi.df.DeepCopy())
+	updated := false
+
+	for i := range dfi.df.Status.Cluster.ActiveMigrations {
+		mig := &dfi.df.Status.Cluster.ActiveMigrations[i]
+		if mig.Status == dfv1alpha1.MigrationStateFinished || mig.Status == dfv1alpha1.MigrationStateFailed {
+			continue
+		}
+
+		// Check migration status on the TARGET shard (the one receiving slots)
+		targetMaster := masters[mig.TargetShard]
+		if targetMaster == nil {
+			dfi.log.Info("target shard master not found for status update", "shard", mig.TargetShard)
+			continue
+		}
+
+		status, err := dfi.checkMigrationStatus(ctx, targetMaster)
+		if err != nil {
+			dfi.log.Info("failed to check migration status on target for update", "shard", mig.TargetShard, "err", err)
+			continue
+		}
+
+		// Update status based on response from TARGET node
+		if strings.Contains(status, "FATAL") {
+			mig.Status = dfv1alpha1.MigrationStateFailed
+			updated = true
+		} else if strings.Contains(status, "FINISHED") {
+			mig.Status = dfv1alpha1.MigrationStateFinished
+			updated = true
+		} else if status != "" && mig.Status == dfv1alpha1.MigrationStatePending {
+			// Migration has started (non-empty status that's not FINISHED)
+			mig.Status = dfv1alpha1.MigrationStateSyncing
+			updated = true
+		}
+	}
+
+	if updated {
+		if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+			return fmt.Errorf("failed to update migration statuses: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// cleanupDrainedShards deletes StatefulSets and Services for shards that have been
+// fully drained during scale-down.
+func (dfi *DragonflyInstance) cleanupDrainedShards(ctx context.Context, shardNames []string) error {
+	for _, shardName := range shardNames {
+		statefulSetName := fmt.Sprintf("%s-%s", dfi.df.Name, shardName)
+		serviceName := fmt.Sprintf("%s-%s-headless", dfi.df.Name, shardName)
+		pdbName := fmt.Sprintf("%s-%s", dfi.df.Name, shardName)
+
+		// Delete StatefulSet
+		sts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      statefulSetName,
+				Namespace: dfi.df.Namespace,
+			},
+		}
+		if err := dfi.client.Delete(ctx, sts); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete StatefulSet %s: %w", statefulSetName, err)
+		}
+		dfi.log.Info("deleted StatefulSet for drained shard", "statefulSet", statefulSetName)
+
+		// Delete headless Service
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: dfi.df.Namespace,
+			},
+		}
+		if err := dfi.client.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete Service %s: %w", serviceName, err)
+		}
+		dfi.log.Info("deleted Service for drained shard", "service", serviceName)
+
+		// Delete PDB if exists
+		pdb := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      pdbName,
+				Namespace: dfi.df.Namespace,
+			},
+		}
+		if err := dfi.client.Delete(ctx, pdb); err != nil && !apierrors.IsNotFound(err) {
+			dfi.log.Info("failed to delete PDB (may not exist)", "pdb", pdbName, "err", err)
+		}
+	}
+
+	return nil
+}
+
+// reconcileSlotMigration handles slot migration during cluster scaling.
+// It implements the migration state machine:
+// 1. Detect scale change
+// 2. Compute migration plan
+// 3. Apply config with migrations
+// 4. Monitor migration progress
+// 5. Apply final config (scale-up) or cleanup resources (scale-down)
+func (dfi *DragonflyInstance) reconcileSlotMigration(ctx context.Context, masters map[string]*corev1.Pod, shardPods map[string][]*corev1.Pod, allPods []*corev1.Pod) (ctrl.Result, bool, error) {
+	status := dfi.getStatus()
+
+	// Check if there are active migrations in progress
+	if status.Cluster != nil && len(status.Cluster.ActiveMigrations) > 0 {
+		return dfi.handleActiveMigrations(ctx, masters, shardPods, allPods)
+	}
+
+	// Check if there are pending scale-down cleanups
+	if status.Cluster != nil && len(status.Cluster.ScaleDownPending) > 0 {
+		return dfi.handleScaleDownCleanup(ctx, masters, shardPods, allPods)
+	}
+
+	// Detect if scaling is needed
+	scaleUp, scaleDown, delta := dfi.detectScaleChange()
+	if !scaleUp && !scaleDown {
+		return ctrl.Result{}, false, nil // No scaling needed
+	}
+
+	dfi.log.Info("scale change detected", "scaleUp", scaleUp, "scaleDown", scaleDown, "delta", delta)
+
+	previousShards := status.Cluster.PreviousShards
+	targetShards := dfi.df.Spec.Cluster.Shards
+
+	// Compute migration plan
+	plan := computeMigrationPlan(previousShards, targetShards)
+	if len(plan.Migrations) == 0 {
+		dfi.log.Info("no migrations needed for scaling")
+		return ctrl.Result{}, false, nil
+	}
+
+	dfi.log.Info("computed migration plan", "migrations", len(plan.Migrations))
+
+	// For scale-up: wait for new shard pods to be ready before starting migration
+	if scaleUp {
+		for i := previousShards; i < targetShards; i++ {
+			shardName := fmt.Sprintf("shard-%d", i)
+			pods := shardPods[shardName]
+			if len(pods) == 0 {
+				dfi.log.Info("waiting for new shard pods to be created", "shard", shardName)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+			}
+			for _, pod := range pods {
+				ready, err := dfi.isPodReady(ctx, pod)
+				if err != nil || !ready {
+					dfi.log.Info("waiting for new shard pod to be ready", "shard", shardName, "pod", pod.Name)
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+				}
+			}
+		}
+	}
+
+	// For scale-down: mark shards as pending deletion
+	if scaleDown {
+		pendingShards := make([]string, 0, delta)
+		for i := targetShards; i < previousShards; i++ {
+			pendingShards = append(pendingShards, fmt.Sprintf("shard-%d", i))
+		}
+
+		patchFrom := client.MergeFrom(dfi.df.DeepCopy())
+		if dfi.df.Status.Cluster == nil {
+			dfi.df.Status.Cluster = &dfv1alpha1.ClusterStatus{}
+		}
+		dfi.df.Status.Cluster.ScaleDownPending = pendingShards
+		if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+			return ctrl.Result{}, true, fmt.Errorf("failed to set scale-down pending shards: %w", err)
+		}
+		dfi.log.Info("marked shards as scale-down pending", "shards", pendingShards)
+	}
+
+	if scaleDown {
+		if err := validateScaleDownMasters(masters, previousShards, targetShards); err != nil {
+			dfi.log.Info("waiting for draining shard masters", "err", err)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+		}
+	}
+
+	// Build and apply config with migrations
+	configJSON, _, err := dfi.buildClusterConfigWithMigrations(ctx, masters, shardPods, plan.Migrations, targetShards)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to build cluster config with migrations: %w", err)
+	}
+
+	if err := dfi.applyClusterConfig(ctx, configJSON, allPods); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to apply cluster config with migrations: %w", err)
+	}
+
+	dfi.log.Info("applied cluster config with migrations")
+
+	// Set migration timestamps and update status only after config is applied
+	now := metav1.Now()
+	for i := range plan.Migrations {
+		plan.Migrations[i].StartedAt = &now
+	}
+
+	patchFrom := client.MergeFrom(dfi.df.DeepCopy())
+	if dfi.df.Status.Cluster == nil {
+		dfi.df.Status.Cluster = &dfv1alpha1.ClusterStatus{}
+	}
+	dfi.df.Status.Cluster.ActiveMigrations = plan.Migrations
+	dfi.df.Status.Phase = PhaseConfiguring
+	if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to set active migrations: %w", err)
+	}
+
+	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "SlotMigrationStarted",
+		fmt.Sprintf("Starting slot migration: %d migrations planned", len(plan.Migrations)))
+
+	// Requeue to monitor migration progress
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+}
+
+// handleActiveMigrations monitors and handles active migrations.
+func (dfi *DragonflyInstance) handleActiveMigrations(ctx context.Context, masters map[string]*corev1.Pod, shardPods map[string][]*corev1.Pod, allPods []*corev1.Pod) (ctrl.Result, bool, error) {
+	// Update migration statuses
+	if err := dfi.updateMigrationStatuses(ctx, masters); err != nil {
+		dfi.log.Info("failed to update migration statuses", "err", err)
+	}
+
+	// Check if all migrations are finished
+	finished, err := dfi.checkAllMigrationsFinished(ctx, masters)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to check migration status: %w", err)
+	}
+
+	if !finished {
+		dfi.log.Info("migrations still in progress")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
+	}
+
+	dfi.log.Info("all migrations finished")
+	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "SlotMigrationFinished", "All slot migrations completed successfully")
+
+	// Clear active migrations and apply final config
+	patchFrom := client.MergeFrom(dfi.df.DeepCopy())
+	dfi.df.Status.Cluster.ActiveMigrations = nil
+
+	// Check if this was a scale-down (we have pending shards to clean up)
+	if len(dfi.df.Status.Cluster.ScaleDownPending) > 0 {
+		// Don't update PreviousShards yet - we still need to clean up
+		if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+			return ctrl.Result{}, true, fmt.Errorf("failed to clear active migrations: %w", err)
+		}
+		// Continue to cleanup phase
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, true, nil
+	}
+
+	// Scale-up: update previous shards and apply final config
+	dfi.df.Status.Cluster.PreviousShards = dfi.df.Spec.Cluster.Shards
+	dfi.df.Status.Phase = PhaseReady
+	if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to update status after migration: %w", err)
+	}
+
+	// Build and apply final config without migrations
+	configJSON, hash, err := dfi.buildClusterConfig(ctx, masters, shardPods)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to build final cluster config: %w", err)
+	}
+
+	if err := dfi.applyClusterConfig(ctx, configJSON, allPods); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to apply final cluster config: %w", err)
+	}
+
+	// Update config hash
+	patchFrom = client.MergeFrom(dfi.df.DeepCopy())
+	now := metav1.Now()
+	dfi.df.Status.Cluster.ConfigHash = hash
+	dfi.df.Status.Cluster.ObservedGeneration = dfi.df.Generation
+	dfi.df.Status.Cluster.LastConfigAppliedAt = &now
+	if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to update config hash: %w", err)
+	}
+
+	return ctrl.Result{}, false, nil
+}
+
+// handleScaleDownCleanup handles the final cleanup phase of scale-down operations.
+func (dfi *DragonflyInstance) handleScaleDownCleanup(ctx context.Context, masters map[string]*corev1.Pod, shardPods map[string][]*corev1.Pod, allPods []*corev1.Pod) (ctrl.Result, bool, error) {
+	pendingShards := dfi.df.Status.Cluster.ScaleDownPending
+	dfi.log.Info("cleaning up drained shards", "shards", pendingShards)
+
+	// First, apply the final config with only the remaining shards
+	// This removes the drained shards from the cluster configuration
+	targetShards := dfi.df.Spec.Cluster.Shards
+
+	// Filter masters and shardPods to only include remaining shards
+	remainingMasters := make(map[string]*corev1.Pod)
+	remainingShardPods := make(map[string][]*corev1.Pod)
+	var remainingAllPods []*corev1.Pod
+
+	for i := int32(0); i < targetShards; i++ {
+		shardName := fmt.Sprintf("shard-%d", i)
+		if master, ok := masters[shardName]; ok {
+			remainingMasters[shardName] = master
+		}
+		if pods, ok := shardPods[shardName]; ok {
+			remainingShardPods[shardName] = pods
+			remainingAllPods = append(remainingAllPods, pods...)
+		}
+	}
+
+	// Build config for remaining shards only
+	configJSON, hash, err := dfi.buildClusterConfigForShards(ctx, remainingMasters, remainingShardPods, targetShards)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to build final cluster config: %w", err)
+	}
+
+	// Apply to remaining pods only
+	if err := dfi.applyClusterConfig(ctx, configJSON, remainingAllPods); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to apply final cluster config: %w", err)
+	}
+
+	// Now safe to delete the orphaned resources
+	if err := dfi.cleanupDrainedShards(ctx, pendingShards); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to cleanup drained shards: %w", err)
+	}
+
+	dfi.eventRecorder.Event(dfi.df, corev1.EventTypeNormal, "ScaleDownComplete",
+		fmt.Sprintf("Successfully scaled down cluster and removed shards: %v", pendingShards))
+
+	// Update status: clear pending shards, update previousShards
+	patchFrom := client.MergeFrom(dfi.df.DeepCopy())
+	dfi.df.Status.Cluster.ScaleDownPending = nil
+	dfi.df.Status.Cluster.PreviousShards = targetShards
+	dfi.df.Status.Cluster.ConfigHash = hash
+	dfi.df.Status.Cluster.ObservedGeneration = dfi.df.Generation
+	now := metav1.Now()
+	dfi.df.Status.Cluster.LastConfigAppliedAt = &now
+	dfi.df.Status.Phase = PhaseReady
+	if err := dfi.client.Status().Patch(ctx, dfi.df, patchFrom); err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to update status after cleanup: %w", err)
+	}
+
+	return ctrl.Result{}, false, nil
+}
+
+// buildClusterConfigForShards builds a cluster config JSON for a specific set of shards.
+// Used when we need to exclude shards being removed during scale-down.
+func (dfi *DragonflyInstance) buildClusterConfigForShards(ctx context.Context, masters map[string]*corev1.Pod, shardPods map[string][]*corev1.Pod, numShards int32) (string, string, error) {
+	var nodes []clusterNodeAddress
+
+	// Compute slot ranges for the target number of shards
+	slotRanges := computeSlotRanges(numShards)
+
+	for i := int32(0); i < numShards; i++ {
+		shardName := fmt.Sprintf("shard-%d", i)
+		master := masters[shardName]
+		if master == nil {
+			return "", "", fmt.Errorf("shard %s has no master", shardName)
+		}
+
+		masterNode, err := dfi.getClusterNodeInfo(ctx, master)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to fetch master id for shard %s: %w", shardName, err)
+		}
+
+		replicas := []clusterNode{}
+		for _, pod := range shardPods[shardName] {
+			if pod.Name == master.Name {
+				continue
+			}
+			node, err := dfi.getClusterNodeInfo(ctx, pod)
+			if err != nil {
+				return "", "", fmt.Errorf("failed to fetch replica id for shard %s: %w", shardName, err)
+			}
+			replicas = append(replicas, node)
+		}
+
+		nodes = append(nodes, clusterNodeAddress{
+			SlotRanges: slotRanges[shardName],
+			Master:     &masterNode,
+			Replicas:   replicas,
+		})
+	}
+
+	payload, err := json.Marshal(nodes)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to marshal cluster config: %w", err)
+	}
+
+	hash := sha256.Sum256(payload)
+	dfi.log.Info("generated cluster config for shards", "numShards", numShards, "config", string(payload))
+	return string(payload), hex.EncodeToString(hash[:]), nil
 }

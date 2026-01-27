@@ -173,7 +173,22 @@ func generateClusterResources(df *resourcesv1.Dragonfly, defaultDragonflyImage s
 		masterAntiAffinity = *df.Spec.Cluster.MasterAntiAffinity
 	}
 
-	for i := int32(0); i < df.Spec.Cluster.Shards; i++ {
+	// Determine effective shard count: include scale-down pending shards
+	// These shards are being drained and should not be deleted until migration completes
+	effectiveShards := df.Spec.Cluster.Shards
+	scaleDownPendingSet := make(map[string]bool)
+	if df.Status.Cluster != nil {
+		if df.Status.Cluster.PreviousShards > effectiveShards {
+			effectiveShards = df.Status.Cluster.PreviousShards
+		}
+		if len(df.Status.Cluster.ScaleDownPending) > 0 {
+			for _, shardName := range df.Status.Cluster.ScaleDownPending {
+				scaleDownPendingSet[shardName] = true
+			}
+		}
+	}
+
+	for i := int32(0); i < effectiveShards; i++ {
 		shardName := fmt.Sprintf("shard-%d", i)
 		shardSelector := map[string]string{
 			ShardNameLabelKey: shardName,

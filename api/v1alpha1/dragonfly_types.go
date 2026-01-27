@@ -219,6 +219,37 @@ type SlotRange struct {
 	End   int32 `json:"end"`
 }
 
+// MigrationState represents the current state of a slot migration operation.
+// +kubebuilder:validation:Enum=Pending;Syncing;Finished;Failed
+type MigrationState string
+
+const (
+	// MigrationStatePending indicates the migration has been planned but not yet started.
+	MigrationStatePending MigrationState = "Pending"
+	// MigrationStateSyncing indicates the migration is actively transferring data.
+	MigrationStateSyncing MigrationState = "Syncing"
+	// MigrationStateFinished indicates the migration completed successfully.
+	MigrationStateFinished MigrationState = "Finished"
+	// MigrationStateFailed indicates the migration failed.
+	MigrationStateFailed MigrationState = "Failed"
+)
+
+// SlotMigration tracks an in-progress slot migration between shards.
+type SlotMigration struct {
+	// SourceShard is the shard slots are moving from (e.g., "shard-0").
+	SourceShard string `json:"sourceShard"`
+	// TargetShard is the shard slots are moving to (e.g., "shard-2").
+	TargetShard string `json:"targetShard"`
+	// SlotRanges being migrated.
+	SlotRanges []SlotRange `json:"slotRanges"`
+	// Status indicates the current state of this migration.
+	// +optional
+	Status MigrationState `json:"status,omitempty"`
+	// StartedAt is when the migration began.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+}
+
 type OwnedObjectsMetadata struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
@@ -417,6 +448,17 @@ type ClusterStatus struct {
 	// Used to determine when the next backup should run.
 	// +optional
 	LastScheduledBackup *metav1.Time `json:"lastScheduledBackup,omitempty"`
+
+	// PreviousShards tracks the last known shard count for detecting scaling operations.
+	// +optional
+	PreviousShards int32 `json:"previousShards,omitempty"`
+	// ActiveMigrations tracks in-progress slot migrations during scaling.
+	// +optional
+	ActiveMigrations []SlotMigration `json:"activeMigrations,omitempty"`
+	// ScaleDownPending lists shards pending deletion after draining slots.
+	// These shards still exist but are being drained of data.
+	// +optional
+	ScaleDownPending []string `json:"scaleDownPending,omitempty"`
 }
 
 //+kubebuilder:object:root=true
